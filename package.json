@@ -1,0 +1,68 @@
+{
+  "name": "socrata-leads",
+  "version": "1.0.0",
+  "description": "City-agnostic pipeline for ingesting Socrata datasets and identifying business opening leads",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "migrate": "tsx src/storage/migrations/run.ts",
+    "extract": "tsx src/extract/run.ts",
+    "normalize": "tsx src/normalize/run.ts",
+    "fuse": "tsx src/fuse/run.ts",
+    "score": "tsx src/score/run.ts",
+    "export": "tsx src/export/run.ts",
+    "export-future": "tsx src/export/run-future.ts",
+    "daily": "tsx src/orchestrate/daily.ts",
+    "backfill": "tsx src/orchestrate/backfill.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test-llm": "tsx src/util/test-llm.ts",
+    "analyze-leads": "tsx src/analyze-leads.ts",
+    "detect-new-businesses": "tsx src/detect-new-businesses.ts",
+    "lint": "eslint src/ --ext .ts",
+    "lint:fix": "eslint src/ --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,md}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,md}\"",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "clean": "rm -rf dist coverage"
+  },
+  "keywords": [
+    "socrata",
+    "data-pipeline",
+    "business-leads",
+    "permits",
+    "licenses",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "yaml": "^2.3.4",
+    "zod": "^3.22.4",
+    "better-sqlite3": "^9.2.2",
+    "p-limit": "^5.0.0",
+    "date-fns": "^3.0.6",
+    "csv-stringify": "^6.4.5",
+    "dotenv": "^16.3.1",
+    "undici": "^6.6.2",
+    "fast-glob": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "@types/better-sqlite3": "^7.6.8",
+    "typescript": "^5.3.3",
+    "tsx": "^4.6.2",
+    "vitest": "^1.1.3",
+    "@vitest/coverage-v8": "^1.1.3",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/eslint-plugin": "^6.17.0",
+    "@typescript-eslint/parser": "^6.17.0",
+    "prettier": "^3.1.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

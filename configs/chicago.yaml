@@ -1,0 +1,152 @@
+city: chicago
+base_url: https://data.cityofchicago.org
+datasets:
+  building_permits:
+    id: ydr8-5enu
+    select:
+      - permit_
+      - permit_type
+      - application_start_date
+      - permit_status
+      - street_number
+      - street_direction
+      - street_name
+      - work_description
+      - latitude
+      - longitude
+      - contact_1_name
+    where: "upper(permit_status) IN ('ISSUED','RELEASED','PERMIT ISSUED')"
+    order_by: application_start_date
+    watermark_field: application_start_date
+    map:
+      business_name: permit_type
+      address: "CONCAT(street_number,' ',COALESCE(street_direction,''),' ',street_name)"
+      lat: latitude
+      lon: longitude
+      status: permit_status
+      event_date: application_start_date
+      type: permit_type
+      description: work_description
+      phone: contact_1_name
+      email: null
+      source_link: ":self"
+  liquor_licenses:
+    id: nrmj-3kcf
+    select:
+      - id
+      - license_status
+      - license_start_date
+      - date_issued
+      - legal_name
+      - doing_business_as_name
+      - address
+      - latitude
+      - longitude
+    where: "upper(license_status) = 'AAI'"
+    order_by: id
+    watermark_field: id
+    map:
+      business_name: "COALESCE(doing_business_as_name, legal_name)"
+      address: address
+      lat: latitude
+      lon: longitude
+      status: license_status
+      event_date: license_start_date
+      future_date: license_start_date
+      type: "Liquor License"
+      description: ""
+      phone: null
+      email: null
+      source_link: ":self"
+  food_inspections:
+    id: 4ijn-s7e5
+    select:
+      - inspection_id
+      - dba_name
+      - aka_name
+      - license_
+      - facility_type
+      - risk
+      - address
+      - inspection_date
+      - inspection_type
+      - results
+      - latitude
+      - longitude
+    where: "upper(results) IN ('PASS','PASS W/ CONDITIONS') AND upper(inspection_type) LIKE 'LICENSE%' AND upper(inspection_type) NOT LIKE '%RE-%' AND upper(inspection_type) NOT LIKE '%COMPLAINT%' AND upper(inspection_type) NOT LIKE '%CANVASS%'"
+    order_by: inspection_date
+    watermark_field: inspection_date
+    map:
+      business_name: "COALESCE(dba_name, aka_name)"
+      address: address
+      lat: latitude
+      lon: longitude
+      status: results
+      event_date: inspection_date
+      type: "CONCAT('Food Inspection - ', inspection_type)"
+      description: "CONCAT(facility_type, ' - Risk: ', risk)"
+      phone: null
+      email: null
+      source_link: ":self"
+  building_violations:
+    id: 22u3-xenr
+    select:
+      - id
+      - violation_date
+      - violation_code
+      - violation_status
+      - violation_description
+      - inspection_number
+      - inspection_status
+      - inspection_category
+      - address
+      - latitude
+      - longitude
+    where: "upper(inspection_status) IN ('PASSED','FAILED','INCOMPLETE')"
+    order_by: violation_date
+    watermark_field: violation_date
+    map:
+      business_name: violation_description
+      address: address
+      lat: latitude
+      lon: longitude
+      status: inspection_status
+      event_date: violation_date
+      type: "CONCAT('Building Inspection - ', inspection_category)"
+      description: "CONCAT(violation_code, ': ', violation_description)"
+      phone: null
+      email: null
+      source_link: ":self"
+  business_licenses:
+    id: uupf-x98q
+    select:
+      - license_id
+      - account_number
+      - doing_business_as_name
+      - legal_name
+      - address
+      - license_status
+      - license_start_date
+      - expiration_date
+      - license_approved_for_issuance
+      - application_created_date
+      - business_activity
+      - license_number
+      - latitude
+      - longitude
+    where: "upper(license_status) IN ('AAC','AAI','REV')"
+    order_by: license_id
+    watermark_field: license_id
+    map:
+      business_name: "COALESCE(doing_business_as_name, legal_name)"
+      address: address
+      lat: latitude
+      lon: longitude
+      status: license_status
+      event_date: "COALESCE(license_approved_for_issuance, application_created_date)"
+      future_date: license_start_date
+      type: "Business License"
+      description: business_activity
+      phone: null
+      email: null
+      source_link: ":self"

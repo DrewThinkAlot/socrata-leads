@@ -1,0 +1,57 @@
+city: seattle
+base_url: https://data.seattle.gov
+datasets:
+  building_permits:
+    id: 76t5-zqzr
+    select:
+      - PermitNum
+      - PermitClass
+      - PermitType
+      - Description
+      - ApplicationDate
+      - IssuedDate
+      - Address
+      - Latitude
+      - Longitude
+      - Status
+      - ApplicantName
+      - ContactPhone
+    where: "Status IN ('Issued','Approved','Ready for Issuance')"
+    order_by: ApplicationDate
+    watermark_field: ApplicationDate
+    map:
+      business_name: PermitType
+      address: Address
+      lat: Latitude
+      lon: Longitude
+      status: Status
+      event_date: "COALESCE(IssuedDate, ApplicationDate)"
+      type: PermitClass
+      description: Description
+      source_link: ":self"
+  liquor_licenses:
+    id: 3h7e-fjgn
+    select:
+      - LicenseNumber
+      - LicenseType
+      - LicenseStatus
+      - EffectiveDate
+      - BusinessName
+      - TradeName
+      - Address
+      - Latitude
+      - Longitude
+      - Phone
+    where: "upper(LicenseStatus) IN ('ACTIVE','ISSUED')"
+    order_by: EffectiveDate
+    watermark_field: EffectiveDate
+    map:
+      business_name: "COALESCE(TradeName, BusinessName)"
+      address: Address
+      lat: Latitude
+      lon: Longitude
+      status: LicenseStatus
+      event_date: EffectiveDate
+      type: LicenseType
+      description: ""
+      source_link: ":self"

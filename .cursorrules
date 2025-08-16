@@ -1,0 +1,45 @@
+# Socrata Leads Pipeline
+
+## Project Purpose
+Build a city-agnostic pipeline that ingests datasets from Socrata portals, normalizes them to a canonical schema, fuses signals (permits + licenses), scores openings, and exports 12-lead "drops" per market.
+
+## Directory Structure
+- `src/` - Main source code
+  - `index.ts` - Main entry point
+  - `types.ts` - Shared type definitions
+  - `util/` - Utility functions (backoff, logger, address, csv, dates)
+  - `soda/` - Socrata Open Data API client
+  - `config/` - Configuration loading and validation
+  - `adapters/` - Data source adapters (Socrata, ArcGIS stub)
+  - `storage/` - Database abstraction layer
+  - `extract/` - Data extraction pipeline
+  - `normalize/` - Data normalization pipeline
+  - `fuse/` - Signal fusion rules and processing
+  - `score/` - Lead scoring algorithm
+  - `export/` - CSV export functionality
+  - `orchestrate/` - Daily and backfill orchestration
+- `configs/` - Per-city YAML configuration files
+- `tests/` - Test files
+
+## Core Rules
+1. **No hardcoded field names** - Everything must come from city configs
+2. **Strong typing** - Use TypeScript strictly, no `any` types
+3. **Exhaustive switch statements** - Handle all dataset names explicitly
+4. **Functional core, imperative shell** - Small pure functions with tests
+5. **Config-driven design** - All city-specific logic in YAML configs
+
+## Code Style
+- Use ESM modules
+- Prefer functional programming patterns
+- Write small, testable functions
+- Use descriptive variable names
+- Add JSDoc comments for public APIs
+
+## Privacy Mode
+ON - Avoid external calls except to configured Socrata endpoints
+
+## Testing
+- Write tests for all pure functions
+- Use fixtures for complex data scenarios
+- Test error conditions and edge cases
+- Maintain high test coverage
