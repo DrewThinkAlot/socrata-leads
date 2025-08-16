@@ -104,7 +104,9 @@ async function fetchMockJobPostings(
   });
 
   return filteredPostings.map(posting => ({
-    id: posting.id,
+    uid: `job_${posting.id}`,
+    city,
+    dataset: 'job_postings',
     business_name: posting.company,
     address: posting.address,
     lat: posting.lat,
@@ -113,10 +115,9 @@ async function fetchMockJobPostings(
     event_date: posting.posted_date,
     type: `Job Posting - ${posting.title}`,
     description: posting.description,
-    phone: null,
-    email: null,
     source_link: `https://indeed.com/job/${posting.id}`,
-    payload: posting,
+    raw_id: posting.id,
+    created_at: new Date().toISOString(),
   }));
 }
 

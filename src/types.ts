@@ -37,6 +37,7 @@ export interface Event {
   city: string;
   address: string;
   name: string | undefined;
+  description?: string;
   predicted_open_week: string;
   signal_strength: number;
   evidence: NormalizedRecord[];
@@ -46,7 +47,7 @@ export interface Event {
 // SpotOn-specific business intelligence
 export interface SpotOnBusinessIntelligence {
   business_category: string;
-  service_model: 'full-service' | 'fast-casual' | 'takeout-only' | 'delivery-first' | 'unknown';
+  service_model: 'full-service' | 'fast-casual' | 'takeout-only' | 'delivery-first' | 'pop-up' | 'unknown';
   seat_capacity?: number;
   square_footage?: number;
   liquor_license_type?: 'full-bar' | 'beer-wine' | 'restaurant' | 'tavern' | 'unknown';
@@ -60,6 +61,7 @@ export interface SpotOnBusinessIntelligence {
   has_multiple_printers?: boolean;
   spoton_score: number;
   filter_matches: SpotOnFilterMatch[];
+  is_pop_up_vendor?: boolean;
 }
 
 export interface SpotOnFilterMatch {
@@ -79,6 +81,10 @@ export interface Lead {
   email: string | undefined;
   score: number;
   spoton_intelligence: SpotOnBusinessIntelligence;
+  project_stage?: string;
+  days_remaining?: number;
+  stage_confidence?: string;
+  days_confidence?: string;
   evidence: Event[];
   created_at: string;
 }
@@ -110,6 +116,7 @@ export interface SpotOnFilterConfig {
   timeline_window_days: [number, number];
   service_model_weights: Record<string, number>;
   operator_type_weights: Record<string, number>;
+  exclude_pop_up_vendors: boolean;
 }
 
 export interface CityConfig {
@@ -150,6 +157,7 @@ export interface ExtractArgs {
   dataset?: string;
   since?: string;
   maxRecords?: number;
+  optimized?: boolean;
 }
 
 export interface ExportArgs {
@@ -180,6 +188,8 @@ export interface Storage {
   // Lead operations
   insertLead(lead: Omit<Lead, 'created_at'>): Promise<void>;
   getLeadsByCity(city: string, limit?: number): Promise<Lead[]>;
+  // Leads by period (for evaluation)
+  getLeadsByPeriod(city: string, periodStart: Date, periodEnd: Date): Promise<Lead[]>;
   
   // Checkpoint operations
   getLastCheckpoint(city: string, dataset: string): Promise<string | null>;
@@ -188,6 +198,14 @@ export interface Storage {
   // Query operations for export
   queryForExport(city: string, limit: number): Promise<Lead[]>;
   queryFutureLeads(city: string, limit: number): Promise<Lead[]>;
+
+  // Evaluation: Ground truth operations
+  insertGroundTruth(record: GroundTruthRecord): Promise<void>;
+  getGroundTruthByPeriod(city: string, periodStart: Date, periodEnd: Date): Promise<GroundTruthRecord[]>;
+
+  // Evaluation: Results and lead evaluations
+  insertEvaluationResult(result: EvaluationResult): Promise<void>;
+  insertLeadEvaluation(evaluation: LeadEvaluation): Promise<void>;
   
   // Cleanup operations
   close(): Promise<void>;
@@ -227,4 +245,115 @@ export class StorageError extends Error {
     super(message);
     this.name = 'StorageError';
   }
+}
+
+// Occupancy Certificate
+export interface OccupancyCertificate {
+  id: string;
+  permit_number: string;
+  certificate_number: string;
+  issue_date: string;
+  expiration_date?: string;
+  building_type: string;
+  occupancy_type: string;
+  square_footage?: number;
+  address: string;
+  latitude?: number;
+  longitude?: number;
+  status: 'ISSUED' | 'EXPIRED' | 'PENDING' | 'REVOKED';
+  source_city: string;
+  source_url: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// Final Inspection
+export interface FinalInspection {
+  id: string;
+  permit_number: string;
+  inspection_type: 'FINAL' | 'BUILDING_FINAL';
+  inspection_date: string;
+  result: 'PASSED' | 'FAILED' | 'PENDING' | 'INCOMPLETE';
+  inspector_name?: string;
+  notes?: string;
+  address: string;
+  latitude?: number;
+  longitude?: number;
+  source_city: string;
+  source_url: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// Lead Enrichment
+export interface LeadEnrichment {
+  final_inspection?: FinalInspection;
+  days_since_final_inspection?: number;
+  has_passed_final_inspection: boolean;
+}
+
+// Evaluation system types
+export interface GroundTruthRecord {
+  ground_truth_id: string;
+  city: string;
+  business_name: string;
+  address: string;
+  license_number: string;
+  license_issue_date: string;
+  license_type: string;
+  actual_open_date: string;
+  source: 'license' | 'inspection' | 'manual';
+  verification_status: 'verified' | 'pending' | 'disputed';
+  created_at: string;
+}
+
+export interface EvaluationResult {
+  evaluation_id: string;
+  city: string;
+  evaluation_date: string;
+  period_start: string;
+  period_end: string;
+  total_ground_truth: number;
+  total_predictions: number;
+  precision_at_50: number;
+  precision_at_100: number;
+  recall: number;
+  median_lead_time_days: number;
+  cost_per_verified_lead: number;
+  signal_ablation_results?: SignalAblationResult[];
+  geographic_coverage: GeographicCoverage[];
+  false_positive_analysis?: {
+    false_positive_rate: number;
+    false_positive_count: number;
+    total_predictions: number;
+    common_fp_reasons: string[];
+    franchise_fp_count: number;
+    expired_signal_fp_count: number;
+    operational_fp_count: number;
+  };
+  created_at: string;
+}
+
+export interface SignalAblationResult {
+  signal_type: string;
+  precision_impact: number;
+  recall_impact: number;
+  lead_time_impact: number;
+}
+
+export interface GeographicCoverage {
+  ward_or_area: string;
+  predicted_openings: number;
+  actual_openings: number;
+  coverage_ratio: number;
+}
+
+export interface LeadEvaluation {
+  lead_id: string;
+  ground_truth_id?: string;
+  is_true_positive: boolean;
+  is_false_positive: boolean;
+  lead_time_days?: number;
+  prediction_date: string;
+  actual_open_date?: string;
 }

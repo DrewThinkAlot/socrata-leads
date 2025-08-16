@@ -9,6 +9,7 @@ import { parseArgs } from 'util';
 import { loadCityConfig } from '../config/index.js';
 import { createStorage } from '../storage/index.js';
 import { createSocrataAdapter } from '../adapters/socrata.js';
+import { createOptimizedSocrataAdapter } from '../adapters/socrata_optimized.js';
 import { extractJobPostings, DEFAULT_JOB_CONFIG } from '../adapters/job_postings.js';
 import { logger } from '../util/logger.js';
 import { parseDate } from '../util/dates.js';
@@ -44,23 +45,32 @@ function parseCliArgs(): ExtractArgs {
         type: 'string',
         short: 'l',
       },
+      optimized: {
+        type: 'boolean',
+        short: 'o',
+      },
     },
   });
 
   if (values.help) {
     console.log(`
-Usage: npm run extract -- --city <city> [--dataset <dataset>] [--since <date>]
+Usage: npm run extract -- --city <city> [--dataset <dataset>] [--since <date>] [--optimized] [--include-occupancy]
 
 Options:
   -c, --city <city>        City name (required)
   -d, --dataset <dataset>  Specific dataset to extract (optional)
   -s, --since <date>       Extract records since this date (optional)
   -h, --help              Show this help message
+  -o, --optimized         Use optimized Socrata adapter (optional)
+  -i, --include-occupancy  Include occupancy and inspection data extraction (optional)
+  -l, --limit <limit>      Maximum number of records to extract (optional)
 
 Examples:
   npm run extract -- --city chicago
   npm run extract -- --city chicago --dataset building_permits
   npm run extract -- --city chicago --since 2024-01-01
+  npm run extract -- --city chicago --optimized
+  npm run extract -- --city chicago --include-occupancy
     `);
     process.exit(0);
   }
@@ -86,6 +96,11 @@ Examples:
     result.maxRecords = parseInt(values.limit as string, 10);
   }
   
+  if (values.optimized) {
+    result.optimized = true;
+  }
+  
+  
   return result;
 }
 
@@ -98,80 +113,15 @@ async function main() {
   try {
     logger.info('Starting data extraction', args);
 
-    // Load city configuration
-    const cityConfig = loadCityConfig(args.city);
-    
-    // Create storage instance
-    const storage = await createStorage();
-    
-    // Create Socrata adapter
-    const adapter = createSocrataAdapter(cityConfig, storage);
-    
-    // Test connection
-    const isConnected = await adapter.testConnection();
-    if (!isConnected) {
-      throw new Error('Failed to connect to Socrata API');
-    }
-    
-    // Parse since date if provided
-    let sinceDate: Date | undefined;
-    if (args.since) {
-      sinceDate = parseDate(args.since) || undefined;
-      if (!sinceDate) {
-        throw new Error(`Invalid date format: ${args.since}`);
-      }
-    }
-    
-    // Extract data
-    let results: Record<string, { recordCount: number; lastWatermark: string | null }>;
-    
-    if (args.dataset) {
-      // Extract specific dataset
-      if (!cityConfig.datasets[args.dataset]) {
-        throw new Error(`Dataset '${args.dataset}' not found in city '${args.city}' configuration`);
-      }
-      
-      const options: any = {};
-      if (sinceDate) {
-        options.sinceDate = sinceDate;
-      }
-      if (args.maxRecords) {
-        options.maxRecords = args.maxRecords;
-      }
-      
-      const result = await adapter.extractDataset(args.dataset, options);
-      results = { [args.dataset]: result };
-    } else {
-      // Extract all datasets
-      const options: any = {};
-      if (sinceDate) {
-        options.sinceDate = sinceDate;
-      }
-      
-      results = await adapter.extractAllDatasets(options);
-    }
-    
-    // Skip job postings for production accuracy (avoid mock inflating signals)
-    
-    // Log results
-    let totalRecords = 0;
-    for (const [datasetName, result] of Object.entries(results)) {
-      logger.info('Dataset extraction completed', {
-        dataset: datasetName,
-        recordCount: result.recordCount,
-        lastWatermark: result.lastWatermark,
-      });
-      totalRecords += result.recordCount;
-    }
-    
+    const runOpts: { city: string; since?: string; maxRecords?: number; optimized?: boolean } = { city: args.city };
+    if (args.since !== undefined) runOpts.since = args.since;
+    if (args.maxRecords !== undefined) runOpts.maxRecords = args.maxRecords;
+    if (args.optimized !== undefined) runOpts.optimized = args.optimized;
+    await runExtraction(runOpts);
+
     logger.info('Data extraction completed successfully', {
       city: args.city,
-      totalRecords,
-      datasetsProcessed: Object.keys(results).length,
     });
-    
-    // Close storage
-    await storage.close();
     
     process.exit(0);
     
@@ -189,6 +139,50 @@ async function main() {
     process.exit(1);
   }
 }
+
+async function runExtraction(options: {
+  city: string;
+  since?: string;
+  maxRecords?: number;
+  optimized?: boolean;
+}): Promise<void> {
+  const storage = await createStorage();
+  const cityConfig = loadCityConfig(options.city);
+  
+  try {
+    // Extract traditional Socrata datasets
+    const adapter = options.optimized 
+      ? createOptimizedSocrataAdapter(cityConfig, storage)
+      : createSocrataAdapter(cityConfig, storage);
+
+    const sinceDate = options.since ? new Date(options.since) : undefined;
+    
+    logger.info('Starting data extraction', {
+      city: options.city,
+      optimized: options.optimized,
+      since: sinceDate?.toISOString(),
+      maxRecords: options.maxRecords
+    });
+
+    const extractOpts: { sinceDate?: Date; maxRecords?: number } = {};
+    if (sinceDate !== undefined) extractOpts.sinceDate = sinceDate;
+    if (options.maxRecords !== undefined) extractOpts.maxRecords = options.maxRecords;
+    const results = await adapter.extractAllDatasets(extractOpts);
+
+
+    logger.info('Data extraction completed', {
+      city: options.city,
+      results,
+    });
+
+  } catch (error) {
+    logger.error('Data extraction failed', { error });
+    throw error;
+  } finally {
+    await storage.close();
+  }
+}
+
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {

@@ -43,27 +43,152 @@ export class SqliteStorage implements Storage {
     logger.info('SQLite database initialized', { path: dbPath });
   }
 
+  // Leads by period (for evaluation)
+  async getLeadsByPeriod(city: string, periodStart: Date, periodEnd: Date): Promise<Lead[]> {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM leads
+        WHERE city = ?
+          AND created_at >= ?
+          AND created_at <= ?
+        ORDER BY score DESC, created_at DESC
+      `);
+      const rows = stmt.all(city, periodStart.toISOString(), periodEnd.toISOString()) as any[];
+      return rows.map(row => ({
+        ...row,
+        evidence: JSON.parse(row.evidence),
+      }));
+    } catch (error) {
+      throw new StorageError(`Failed to get leads by period: ${error}`);
+    }
+  }
+
+  // Evaluation: Ground truth operations
+  async insertGroundTruth(record: any): Promise<void> {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO ground_truth (
+          ground_truth_id, city, business_name, address, license_number,
+          license_issue_date, license_type, actual_open_date, source,
+          verification_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        record.ground_truth_id,
+        record.city,
+        record.business_name,
+        record.address,
+        record.license_number,
+        record.license_issue_date,
+        record.license_type,
+        record.actual_open_date,
+        record.source,
+        record.verification_status,
+        record.created_at || new Date().toISOString()
+      );
+    } catch (error) {
+      throw new StorageError(`Failed to insert ground truth: ${error}`);
+    }
+  }
+
+  async getGroundTruthByPeriod(city: string, periodStart: Date, periodEnd: Date): Promise<any[]> {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM ground_truth
+        WHERE city = ?
+          AND actual_open_date >= ?
+          AND actual_open_date <= ?
+        ORDER BY actual_open_date ASC
+      `);
+      const rows = stmt.all(city, periodStart.toISOString(), periodEnd.toISOString()) as any[];
+      return rows;
+    } catch (error) {
+      throw new StorageError(`Failed to get ground truth by period: ${error}`);
+    }
+  }
+
+  // Evaluation: Results and lead evaluations
+  async insertEvaluationResult(result: any): Promise<void> {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO evaluation_results (
+          evaluation_id, city, evaluation_date, period_start, period_end,
+          total_ground_truth, total_predictions, precision_at_50, precision_at_100,
+          recall, median_lead_time_days, cost_per_verified_lead,
+          signal_ablation_results, geographic_coverage, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        result.evaluation_id,
+        result.city,
+        result.evaluation_date,
+        result.period_start,
+        result.period_end,
+        result.total_ground_truth,
+        result.total_predictions,
+        result.precision_at_50,
+        result.precision_at_100,
+        result.recall,
+        result.median_lead_time_days,
+        result.cost_per_verified_lead,
+        JSON.stringify(result.signal_ablation_results || []),
+        JSON.stringify(result.geographic_coverage || []),
+        result.created_at || new Date().toISOString()
+      );
+    } catch (error) {
+      throw new StorageError(`Failed to insert evaluation result: ${error}`);
+    }
+  }
+
+  async insertLeadEvaluation(evaluation: any): Promise<void> {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO lead_evaluations (
+          lead_id, ground_truth_id, is_true_positive, is_false_positive,
+          lead_time_days, prediction_date, actual_open_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      stmt.run(
+        evaluation.lead_id,
+        evaluation.ground_truth_id || null,
+        evaluation.is_true_positive ? 1 : 0,
+        evaluation.is_false_positive ? 1 : 0,
+        evaluation.lead_time_days ?? null,
+        evaluation.prediction_date,
+        evaluation.actual_open_date ?? null
+      );
+    } catch (error) {
+      throw new StorageError(`Failed to insert lead evaluation: ${error}`);
+    }
+  }
+
   /**
    * Run database migrations
    */
   async runMigrations(): Promise<void> {
     try {
-      const migrationPath = resolve(process.cwd(), 'src/storage/migrations/001_init.sql');
-      const migrationSql = readFileSync(migrationPath, 'utf-8');
-      
-      // Split by semicolon and execute each statement
-      const statements = migrationSql
-        .split(';')
-        .map(stmt => stmt.trim())
-        .filter(stmt => stmt.length > 0);
-      
+      const migrationsDir = resolve(process.cwd(), 'src/storage/migrations');
+      // Load all .sql files in alphabetical order
+      const fs = await import('fs');
+      const files = fs.readdirSync(migrationsDir)
+        .filter(f => f.endsWith('.sql'))
+        .sort();
+
       this.db.transaction(() => {
-        for (const statement of statements) {
-          this.db.exec(statement);
+        for (const file of files) {
+          const fullPath = resolve(migrationsDir, file);
+          const sql = readFileSync(fullPath, 'utf-8');
+          const statements = sql
+            .split(';')
+            .map(stmt => stmt.trim())
+            .filter(stmt => stmt.length > 0);
+          for (const statement of statements) {
+            this.db.exec(statement);
+          }
         }
       })();
-      
-      logger.info('SQLite migrations completed');
+
+      logger.info('SQLite migrations completed', { files });
     } catch (error) {
       throw new StorageError(`Migration failed: ${error}`);
     }
@@ -87,7 +212,7 @@ export class SqliteStorage implements Storage {
    */
   async getStats(): Promise<Record<string, number>> {
     try {
-      const tables = ['raw', 'normalized', 'events', 'leads', 'checkpoints'];
+      const tables = ['raw', 'normalized', 'events', 'leads', 'checkpoints', 'ground_truth', 'evaluation_results', 'lead_evaluations'];
       const stats: Record<string, number> = {};
       
       for (const table of tables) {

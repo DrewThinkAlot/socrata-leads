@@ -146,6 +146,31 @@ export class SocrataAdapter {
   }
 
   /**
+   * Query a dataset with custom parameters (for evaluation ground truth collection)
+   */
+  async queryDataset(datasetId: string, params: Record<string, any>): Promise<any[]> {
+    try {
+      const client = createSodaClient(this.cityConfig.base_url, getAppToken(this.cityConfig));
+      
+      logger.debug('Querying Socrata dataset', {
+        city: this.cityConfig.city,
+        datasetId,
+        params
+      });
+
+      const response = await client.getJson({
+        baseUrl: this.cityConfig.base_url,
+        path: `/resource/${datasetId}.json`,
+        params
+      });
+      return response;
+    } catch (error) {
+      logger.error('Socrata dataset query failed', { error, datasetId, params });
+      throw error;
+    }
+  }
+
+  /**
    * Test connection to Socrata API
    */
   async testConnection(): Promise<boolean> {

@@ -1,5 +1,14 @@
 city: seattle
 base_url: https://data.seattle.gov
+portal_config:
+  occupancy:
+    base_url: https://web.seattle.gov/sdci/api
+    endpoints:
+      occupancy_certificates: /v2/permits/occupancy
+      final_inspections: /v2/inspections/final
+    api_key: ${SEATTLE_SDCI_API_KEY}
+    rate_limit: 200
+
 datasets:
   building_permits:
     id: 76t5-zqzr

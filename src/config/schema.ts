@@ -31,6 +31,17 @@ export const CityConfigSchema = z.object({
   base_url: z.string().url().describe('Base URL for the Socrata API'),
   app_token: z.string().optional().describe('Optional Socrata app token for higher rate limits'),
   datasets: z.record(z.string(), DatasetConfigSchema).describe('Dataset configurations'),
+  portal_config: z.object({
+    occupancy: z.object({
+      base_url: z.string().url(),
+      endpoints: z.object({
+        occupancy_certificates: z.string(),
+        final_inspections: z.string(),
+      }),
+      api_key: z.string(),
+      rate_limit: z.number().optional(),
+    }).optional(),
+  }).optional(),
 }).strict();
 
 /**
@@ -142,3 +153,15 @@ export function validateCityConfig(config: unknown): {
 export type CityConfig = z.infer<typeof CityConfigSchema>;
 export type DatasetConfig = z.infer<typeof DatasetConfigSchema>;
 export type DatasetMap = z.infer<typeof DatasetMapSchema>;
+
+/**
+ * Get global configuration
+ */
+export function getConfig() {
+  return {
+    LLM_ENABLED: process.env.LLM_ENABLED !== 'false',
+    LLM_SAMPLE_RATE: parseFloat(process.env.LLM_SAMPLE_RATE || '1.0'),
+    LLM_MAX_CALLS_PER_RUN: parseInt(process.env.LLM_MAX_CALLS_PER_RUN || '100'),
+    LLM_CONCURRENCY: parseInt(process.env.LLM_CONCURRENCY || '2'),
+  };
+}

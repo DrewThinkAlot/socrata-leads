@@ -1,5 +1,14 @@
 city: chicago
 base_url: https://data.cityofchicago.org
+portal_config:
+  occupancy:
+    base_url: https://ipi.cityofchicago.org/api
+    endpoints:
+      occupancy_certificates: /v1/occupancy-certificates
+      final_inspections: /v1/final-inspections
+    api_key: ${CHICAGO_IPI_API_KEY}
+    rate_limit: 100
+  
 datasets:
   building_permits:
     id: ydr8-5enu

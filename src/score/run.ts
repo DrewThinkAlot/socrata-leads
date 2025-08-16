@@ -9,7 +9,7 @@ import { parseArgs } from 'util';
 import { createStorage } from '../storage/index.js';
 import { logger } from '../util/logger.js';
 import { getAgeInDays, parseDate } from '../util/dates.js';
-import { analyzeDescription, categorizeBusinessType } from '../util/llm.js';
+import { analyzeDescription, categorizeBusinessType, classifyProjectStage, estimateDaysRemaining, detectOperationalStatus, resolveBusinessEntity, extractContactInfoLLM, calculateDynamicLeadScore } from '../util/llm.js';
 import type { Event, Lead, NormalizedRecord } from '../types.js';
 import { randomUUID } from 'crypto';
 import { analyzeSpotOnIntelligence } from '../filters/spoton.js';
@@ -61,15 +61,181 @@ Examples:
 }
 
 /**
- * Opening timeline patterns (days before typical opening)
+ * Restaurant type definitions
  */
-const OPENING_TIMELINE = {
-  'building_permit': -90,          // 90 days before
-  'liquor_license': -45,           // 45 days before  
-  'food_inspection_pass': -14,     // 2 weeks before (STRONG signal)
-  'building_inspection_passed': -21, // 3 weeks before
-  'food_inspection_fail': -30,     // 30 days before (needs fixes)
+type RestaurantType = 'fast-food' | 'fast-casual' | 'full-service' | 'unknown';
+
+/**
+ * Restaurant-specific opening timeline patterns (days before typical opening)
+ * Based on industry research: fast-food (8-10 weeks), fast-casual (10-14 weeks), full-service (20+ weeks)
+ */
+const RESTAURANT_OPENING_TIMELINES = {
+  'fast-food': {
+    'building_permit': -63,          // 9 weeks average
+    'liquor_license': -35,           // 5 weeks
+    'food_inspection_pass': -10,     // 1.5 weeks (STRONG signal)
+    'building_inspection_passed': -14, // 2 weeks
+    'food_inspection_fail': -21,     // 3 weeks (needs fixes)
+    'equipment_installation': -7,    // 1 week
+    'utility_hookups': -5,           // 5 days (very late stage)
+    'final_inspection': -7,          // 1 week
+  },
+  'fast-casual': {
+    'building_permit': -84,          // 12 weeks average
+    'liquor_license': -42,           // 6 weeks
+    'food_inspection_pass': -15,     // 2+ weeks
+    'building_inspection_passed': -21, // 3 weeks
+    'food_inspection_fail': -28,     // 4 weeks
+    'equipment_installation': -14,   // 2 weeks
+    'utility_hookups': -10,          // 1.5 weeks
+    'final_inspection': -14,         // 2 weeks
+  },
+  'full-service': {
+    'building_permit': -154,         // 22 weeks average
+    'liquor_license': -56,           // 8 weeks
+    'food_inspection_pass': -21,     // 3 weeks
+    'building_inspection_passed': -28, // 4 weeks
+    'food_inspection_fail': -42,     // 6 weeks
+    'equipment_installation': -21,   // 3 weeks
+    'utility_hookups': -14,          // 2 weeks
+    'final_inspection': -21,         // 3 weeks
+  },
+  'unknown': {
+    'building_permit': -90,          // Default fallback
+    'liquor_license': -45,
+    'food_inspection_pass': -14,
+    'building_inspection_passed': -21,
+    'food_inspection_fail': -30,
+    'equipment_installation': -14,
+    'utility_hookups': -10,
+    'final_inspection': -14,
+  }
 };
+
+/**
+ * Detect restaurant type based on business description and permit types
+ */
+function detectRestaurantType(events: Event[]): RestaurantType {
+  const allEvidence = events.flatMap(e => e.evidence);
+  const businessNames = allEvidence.map(r => r.business_name?.toLowerCase() || '').join(' ');
+  const descriptions = allEvidence.map(r => r.description?.toLowerCase() || '').join(' ');
+  const types = allEvidence.map(r => r.type?.toLowerCase() || '').join(' ');
+  
+  const combinedText = `${businessNames} ${descriptions} ${types}`;
+  
+  // Fast-food indicators
+  const fastFoodKeywords = [
+    'mcdonald', 'burger king', 'kfc', 'taco bell', 'subway', 'pizza hut', 'domino',
+    'fast food', 'quick service', 'drive thru', 'drive-thru', 'counter service',
+    'takeout only', 'delivery only', 'grab and go', 'express'
+  ];
+  
+  // Fast-casual indicators
+  const fastCasualKeywords = [
+    'chipotle', 'panera', 'shake shack', 'five guys', 'qdoba', 'panda express',
+    'fast casual', 'counter order', 'casual dining', 'fresh', 'build your own',
+    'made to order', 'artisan', 'craft', 'gourmet fast'
+  ];
+  
+  // Full-service indicators
+  const fullServiceKeywords = [
+    'fine dining', 'full service', 'table service', 'waiter', 'waitress', 'server',
+    'reservation', 'wine list', 'sommelier', 'chef', 'tasting menu', 'prix fixe',
+    'upscale', 'bistro', 'brasserie', 'steakhouse', 'seafood restaurant'
+  ];
+  
+  // Check for liquor license complexity (full-service indicator)
+  const hasComplexLiquor = allEvidence.some(r => {
+    const desc = r.description?.toLowerCase() || '';
+    const type = r.type?.toLowerCase() || '';
+    return desc.includes('full bar') || desc.includes('wine') || 
+           type.includes('liquor') || type.includes('tavern');
+  });
+  
+  // Check for equipment complexity
+  const hasComplexEquipment = combinedText.includes('hood') || 
+                             combinedText.includes('ventilation') ||
+                             combinedText.includes('grease trap') ||
+                             combinedText.includes('fire suppression');
+  
+  // Classification logic
+  if (fastFoodKeywords.some(keyword => combinedText.includes(keyword))) {
+    return 'fast-food';
+  }
+  
+  if (fullServiceKeywords.some(keyword => combinedText.includes(keyword)) || 
+      (hasComplexLiquor && hasComplexEquipment)) {
+    return 'full-service';
+  }
+  
+  if (fastCasualKeywords.some(keyword => combinedText.includes(keyword))) {
+    return 'fast-casual';
+  }
+  
+  // Default classification based on permit complexity
+  const permitCount = new Set(allEvidence.map(r => r.type)).size;
+  if (permitCount >= 4 && hasComplexLiquor) {
+    return 'full-service';
+  } else if (permitCount >= 2) {
+    return 'fast-casual';
+  }
+  
+  return 'unknown';
+}
+
+/**
+ * Get seasonal adjustment factor based on current date
+ */
+function getSeasonalAdjustment(targetDate?: Date): number {
+  const date = targetDate || new Date();
+  const month = date.getMonth() + 1; // 1-12
+  
+  // Q1 (Jan-Mar): 1.3x timeline extension
+  if (month >= 1 && month <= 3) return 1.3;
+  
+  // Q2 (Apr-Jun): 0.9x (prime opening season)
+  if (month >= 4 && month <= 6) return 0.9;
+  
+  // Q3 (Jul-Sep): 1.0x baseline
+  if (month >= 7 && month <= 9) return 1.0;
+  
+  // Q4 (Oct-Dec): 1.4x (holiday avoidance)
+  return 1.4;
+}
+
+/**
+ * Get city-specific permit processing adjustments
+ */
+function getCityProcessingAdjustment(city: string, permitTypes: string[]): number {
+  const permits = permitTypes.join(' ').toLowerCase();
+  
+  switch (city.toLowerCase()) {
+    case 'seattle':
+      // Seattle has faster processing for bundled permits
+      if (permits.includes('construction') && (permits.includes('electrical') || permits.includes('mechanical'))) {
+        return 0.8; // 20% faster for bundled permits
+      }
+      // Food service plan review is standardized at 14 days
+      if (permits.includes('food') || permits.includes('health')) {
+        return 0.9;
+      }
+      return 1.0;
+    
+    case 'chicago':
+      // Chicago has electronic submission requirements that can speed processing
+      if (permits.includes('building') || permits.includes('construction')) {
+        return 0.9; // Slightly faster with electronic systems
+      }
+      // Complex liquor licenses may take longer
+      if (permits.includes('liquor') && permits.includes('tavern')) {
+        return 1.2;
+      }
+      return 1.0;
+    
+    default:
+      return 1.0; // No adjustment for unknown cities
+  }
+}
 
 /**
  * Calculate lead score based on weighted factors and opening progression
@@ -84,8 +250,17 @@ async function calculateLeadScore(events: Event[]): Promise<number> {
     current.signal_strength > prev.signal_strength ? current : prev
   );
   
-  // 1. Enhanced Recency Score with Opening Timeline (0-30 points)
+  // 1. Enhanced Recency Score with Dynamic Opening Timeline (0-35 points)
   const allEvidence = events.flatMap(e => e.evidence);
+  
+  // Detect restaurant type for dynamic timeline calculation
+  const restaurantType = detectRestaurantType(events);
+  const timeline = RESTAURANT_OPENING_TIMELINES[restaurantType];
+  const seasonalFactor = getSeasonalAdjustment();
+  
+  // Get city-specific processing adjustments
+  const permitTypes = [...new Set(allEvidence.map(r => r.type).filter(Boolean))] as string[];
+  const cityFactor = getCityProcessingAdjustment(events[0]?.city || 'unknown', permitTypes);
   const mostRecentDate = allEvidence
     .map(r => parseDate(r.event_date))
     .filter((d): d is Date => d !== null)
@@ -94,70 +269,98 @@ async function calculateLeadScore(events: Event[]): Promise<number> {
   if (mostRecentDate) {
     const ageInDays = getAgeInDays(mostRecentDate);
     
-    // Check if we have high-confidence opening signals
+    // Check for high-confidence opening signals with restaurant-specific timelines
     const hasRecentFoodPass = allEvidence.some(r => {
       const isFood = r.type?.toLowerCase().includes('food inspection') ?? false;
       const isLicense = /license/i.test(r.type || '') || /license/i.test(r.description || '');
       const passed = r.status?.toUpperCase() === 'PASS';
       const d = parseDate(r.event_date);
-      return isFood && isLicense && passed && d && getAgeInDays(d) <= 14;
+      const expectedDays = Math.abs(timeline.food_inspection_pass) * seasonalFactor * cityFactor;
+      return isFood && isLicense && passed && d && getAgeInDays(d) <= expectedDays;
     });
     
     const hasRecentBuildingPass = allEvidence.some(r => {
       const isBld = r.type?.toLowerCase().includes('building inspection') ?? false;
       const passed = r.status?.toUpperCase() === 'PASSED';
       const d = parseDate(r.event_date);
-      return isBld && passed && d && getAgeInDays(d) <= 21;
+      const expectedDays = Math.abs(timeline.building_inspection_passed) * seasonalFactor * cityFactor;
+      return isBld && passed && d && getAgeInDays(d) <= expectedDays;
     });
     
-    // Boost score for strong opening indicators
-    if (hasRecentFoodPass) {
-      score += 20; // Licensing inspection pass is strong but not definitive
+    // Check for equipment installation signals (very strong late-stage indicator)
+    const hasEquipmentSignals = allEvidence.some(r => {
+      const desc = r.description?.toLowerCase() || '';
+      const type = r.type?.toLowerCase() || '';
+      return desc.includes('equipment') || desc.includes('kitchen') || 
+             desc.includes('hood') || desc.includes('installation') ||
+             type.includes('equipment');
+    });
+    
+    // Check for utility hookup signals (very strong late-stage indicator)
+    const hasUtilityHookups = allEvidence.some(r => {
+      const desc = r.description?.toLowerCase() || '';
+      const type = r.type?.toLowerCase() || '';
+      return desc.includes('water service') || desc.includes('gas connection') ||
+             desc.includes('electrical service') || desc.includes('utility hookup') ||
+             desc.includes('water permit') || desc.includes('gas permit') ||
+             type.includes('water service') || type.includes('electrical') ||
+             (type.includes('plumbing') && desc.includes('commercial')) ||
+             (desc.includes('utility') && (desc.includes('connect') || desc.includes('install')));
+    });
+    
+    // Dynamic scoring based on restaurant type and timeline position
+    if (hasUtilityHookups) {
+      score += 32; // Strongest available signal - utilities being connected
+    } else if (hasEquipmentSignals) {
+      score += 30; // Very strong - equipment installation phase
+    } else if (hasRecentFoodPass) {
+      score += 25; // Strong signal with restaurant-specific timing
     } else if (hasRecentBuildingPass) {
-      score += 15; // Building pass alone should not dominate
-    } else if (ageInDays <= 30) {
-      score += 30;
-    } else if (ageInDays <= 60) {
-      score += 25;
-    } else if (ageInDays <= 90) {
-      score += 20;
-    } else if (ageInDays <= 120) {
-      score += 15;
+      score += 20; // Good signal but earlier in timeline
     } else {
-      score += 10;
+      // Standard recency scoring with restaurant-type awareness
+      const buildingPermitWindow = Math.abs(timeline.building_permit) * seasonalFactor * cityFactor;
+      const liquorLicenseWindow = Math.abs(timeline.liquor_license) * seasonalFactor * cityFactor;
+      
+      if (ageInDays <= 30) {
+        score += 30;
+      } else if (ageInDays <= 60) {
+        score += 25;
+      } else if (ageInDays <= liquorLicenseWindow) {
+        score += 20; // Within liquor license window
+      } else if (ageInDays <= buildingPermitWindow) {
+        score += 15; // Within building permit window
+      } else {
+        score += 10;
+      }
     }
   }
   
-  // 2. Permit/License Type Weight (0-30 points)
-  const hasRestaurantSignals = events.some(e =>
-    e.evidence.some(r => {
-      const type = r.type?.toLowerCase() || '';
-      const desc = r.description?.toLowerCase() || '';
-      return type.includes('restaurant') ||
-             type.includes('liquor') ||
-             desc.includes('restaurant') ||
-             desc.includes('kitchen');
-    })
-  );
+  // 2. Restaurant Type & Complexity Weight (0-35 points)
+  const restaurantTypeScore = {
+    'full-service': 35,  // Highest value - complex operations
+    'fast-casual': 30,   // High value - growing segment
+    'fast-food': 25,     // Good value - predictable model
+    'unknown': 20        // Default scoring
+  };
   
-  const hasRetailSignals = events.some(e =>
-    e.evidence.some(r => {
-      const type = r.type?.toLowerCase() || '';
-      const desc = r.description?.toLowerCase() || '';
-      return type.includes('retail') ||
-             type.includes('commercial') ||
-             desc.includes('retail') ||
-             desc.includes('store');
-    })
-  );
+  score += restaurantTypeScore[restaurantType];
   
-  if (hasRestaurantSignals) {
-    score += 30; // Restaurants are high-value leads
-  } else if (hasRetailSignals) {
-    score += 25; // Retail is also valuable
-  } else {
-    score += 15; // Other commercial activities
-  }
+  // Additional complexity bonuses
+  const hasLiquorLicense = allEvidence.some(r => {
+    const type = r.type?.toLowerCase() || '';
+    const desc = r.description?.toLowerCase() || '';
+    return type.includes('liquor') || desc.includes('liquor') || desc.includes('alcohol');
+  });
+  
+  const hasComplexPermits = allEvidence.some(r => {
+    const desc = r.description?.toLowerCase() || '';
+    return desc.includes('hood') || desc.includes('fire suppression') || 
+           desc.includes('grease trap') || desc.includes('ventilation');
+  });
+  
+  if (hasLiquorLicense) score += 5;
+  if (hasComplexPermits) score += 5;
   
   // 3. Contact Information Presence (0-20 points)
   const hasContactInfo = events.some(e =>
@@ -193,8 +396,28 @@ async function calculateLeadScore(events: Event[]): Promise<number> {
     logger.warn('LLM business potential scoring failed, continuing with basic scoring', { error });
   }
   
-  // Cap at 120 (20 points extra from LLM)
-  return Math.min(score, 120);
+  // 6. Dynamic LLM Scoring Enhancement (if enabled)
+  const useDynamicScoring = process.env.LLM_DYNAMIC_SCORING === 'true';
+  if (useDynamicScoring) {
+    try {
+      const dynamicAnalysis = await calculateDynamicLeadScore(events, score);
+      
+      // Use LLM-adjusted score if confidence is high
+      if (dynamicAnalysis.source === 'llm') {
+        logger.debug('Applied dynamic LLM scoring', {
+          originalScore: score,
+          adjustedScore: dynamicAnalysis.score,
+          adjustments: dynamicAnalysis.adjustments
+        });
+        score = dynamicAnalysis.score;
+      }
+    } catch (error) {
+      logger.warn('Dynamic LLM scoring failed, using static score', { error });
+    }
+  }
+  
+  // Cap at 130 (increased due to enhanced scoring)
+  return Math.min(score, 130);
 }
 
 /**
@@ -334,11 +557,12 @@ async function calculateLLMBusinessPotential(events: Event[]): Promise<number> {
 }
 
 /**
- * Extract contact information from events
+ * Extract contact information from events with enhanced LLM extraction
  */
-function extractContactInfo(events: Event[]): { phone?: string; email?: string } {
-  const contact: { phone?: string; email?: string } = {};
+async function extractContactInfo(events: Event[]): Promise<{ phone?: string; email?: string; website?: string; contactPerson?: string }> {
+  const contact: { phone?: string; email?: string; website?: string; contactPerson?: string } = {};
   
+  // First try traditional payload extraction
   for (const event of events) {
     for (const record of event.evidence) {
       const payload = (record as any).payload || {};
@@ -365,11 +589,46 @@ function extractContactInfo(events: Event[]): { phone?: string; email?: string }
     }
   }
   
+  // Enhanced LLM contact extraction if enabled and missing info
+  const useEnhancedExtraction = process.env.LLM_CONTACT_EXTRACTION === 'true';
+  
+  if (useEnhancedExtraction && (!contact.phone || !contact.email)) {
+    try {
+      // Combine all event descriptions for LLM analysis
+      const combinedText = events.flatMap(e => e.evidence)
+        .map(r => `${r.description || ''} ${r.business_name || ''}`)
+        .join(' ')
+        .substring(0, 1000); // Limit text length
+      
+      const primaryEvent = events.reduce((prev, current) =>
+        current.signal_strength > prev.signal_strength ? current : prev
+      );
+      
+      const llmContact = await extractContactInfoLLM(combinedText, primaryEvent.name);
+      
+      // Merge LLM results with existing contact info (prefer existing)
+      if (!contact.phone && llmContact.phone) contact.phone = llmContact.phone;
+      if (!contact.email && llmContact.email) contact.email = llmContact.email;
+      if (llmContact.website) contact.website = llmContact.website;
+      if (llmContact.contactPerson) contact.contactPerson = llmContact.contactPerson;
+      
+      if (llmContact.phone || llmContact.email) {
+        logger.debug('LLM extracted additional contact info', {
+          address: primaryEvent.address,
+          extractedFields: Object.keys(llmContact).filter(k => k !== 'source' && llmContact[k as keyof typeof llmContact])
+        });
+      }
+    } catch (error) {
+      logger.warn('LLM contact extraction failed', { error });
+    }
+  }
+  
   return contact;
 }
 
 /**
  * Analyze an address to determine if it represents a new business opportunity
+ * Enhanced with LLM-based operational detection
  */
 export async function analyzeAddressForNewBusiness(
   address: string,
@@ -384,7 +643,45 @@ export async function analyzeAddressForNewBusiness(
   const addressBusinessLicenses = businessLicenses.filter(l => l.address === address);
   const addressInspections = inspections.filter(i => i.address === address);
   
-  // FILTER 1: Check for operational signals, but allow licensing inspections 30-60 days before opening
+  // Enhanced LLM-based operational detection if enabled
+  const useEnhancedFiltering = process.env.LLM_ENHANCED_FILTERING === 'true';
+  
+  if (useEnhancedFiltering && events.length > 0) {
+    try {
+      // Use LLM to analyze the primary event for operational status
+      const primaryEvent = events.reduce((prev, current) =>
+        current.signal_strength > prev.signal_strength ? current : prev
+      );
+      
+      const allEvidence = events.flatMap(e => e.evidence);
+      const permitTypes = [...new Set(allEvidence.map(r => r.type).filter(Boolean))] as string[];
+      const mostRecentDate = allEvidence
+        .map(r => parseDate(r.event_date))
+        .filter((d): d is Date => d !== null)
+        .sort((a, b) => b.getTime() - a.getTime())[0];
+      
+      const operationalAnalysis = await detectOperationalStatus(
+        primaryEvent.description || '',
+        permitTypes,
+        primaryEvent.name,
+        mostRecentDate?.toISOString()
+      );
+      
+      // If LLM has high confidence that business is operational, filter it out
+      if (operationalAnalysis.isOperational && operationalAnalysis.confidence > 75) {
+        logger.debug('LLM detected operational business', {
+          address,
+          confidence: operationalAnalysis.confidence,
+          businessName: primaryEvent.name
+        });
+        return false;
+      }
+    } catch (error) {
+      logger.warn('LLM operational detection failed, falling back to rule-based', { error });
+    }
+  }
+  
+  // Fallback to original rule-based detection
   const hasOperationalInspections = addressInspections.some(inspection => {
     const inspectionType = inspection.type?.toLowerCase() || '';
     const description = inspection.description?.toLowerCase() || '';
@@ -478,16 +775,41 @@ export async function analyzeAddressForNewBusiness(
 }
 
 /**
- * Create a lead from events
+ * Create a lead from events with project stage classification
  */
 async function createLead(events: Event[], city: string): Promise<Lead> {
   const primaryEvent = events.reduce((prev, current) =>
     current.signal_strength > prev.signal_strength ? current : prev
   );
   
-  const contact = extractContactInfo(events);
+  const contact = await extractContactInfo(events);
   const score = await calculateLeadScore(events);
   const spoton_intelligence = await analyzeSpotOnIntelligence(events);
+  
+  // Extract permit types and issue date for stage classification
+  const allEvidence = events.flatMap(e => e.evidence);
+  const permitTypes = [...new Set(allEvidence.map(r => r.type).filter(Boolean))] as string[];
+  const issueDate = allEvidence
+    .map(r => parseDate(r.event_date))
+    .filter((d): d is Date => d !== null)
+    .sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString();
+  
+  // Get project stage classification
+  const stageAnalysis = await classifyProjectStage(
+    primaryEvent.description || '',
+    primaryEvent.name,
+    permitTypes,
+    issueDate
+  );
+  
+  // Get days remaining estimation
+  const daysAnalysis = await estimateDaysRemaining(
+    stageAnalysis.stage,
+    primaryEvent.description || '',
+    permitTypes,
+    issueDate,
+    primaryEvent.name
+  );
   
   return {
     lead_id: randomUUID(),
@@ -498,6 +820,10 @@ async function createLead(events: Event[], city: string): Promise<Lead> {
     email: contact.email,
     score,
     spoton_intelligence,
+    project_stage: stageAnalysis.stage,
+    days_remaining: daysAnalysis.daysRemaining,
+    stage_confidence: String(stageAnalysis.confidence),
+    days_confidence: String(daysAnalysis.confidence),
     evidence: events,
     created_at: new Date().toISOString(),
   };
@@ -525,12 +851,21 @@ async function main() {
     const operationalAddresses = new Set<string>();
     const now = new Date();
     
-    // Method 1: Food inspection analysis - allow licensing inspections for 30-60 day detection
+    // Method 1: Food inspection analysis with signal expiration
     for (const inspection of inspections) {
       if (!inspection.address) continue;
       
       const inspectionType = inspection.type?.toLowerCase() || '';
       const description = inspection.description?.toLowerCase() || '';
+      
+      // Skip expired signals (older than 180 days)
+      const inspectionDate = parseDate(inspection.event_date);
+      if (!inspectionDate) continue;
+      
+      const ageInDays = getAgeInDays(inspectionDate);
+      if (ageInDays > 180) {
+        continue; // Skip expired signals
+      }
       
       // Allow licensing inspections as they indicate pre-opening phase
       const isLicensingInspection = inspectionType.includes('license') || 
@@ -539,21 +874,25 @@ async function main() {
                                    description.includes('permit');
       
       if (!isLicensingInspection) {
-        const inspectionDate = parseDate(inspection.event_date);
-        if (inspectionDate) {
-          const ageInDays = getAgeInDays(inspectionDate);
-          if (ageInDays <= 90) { // Only mark as operational for non-licensing inspections within 90 days
-            operationalAddresses.add(inspection.address);
-          }
+        if (ageInDays <= 90) { // Only mark as operational for non-licensing inspections within 90 days
+          operationalAddresses.add(inspection.address);
         }
       }
     }
     
-    // Method 2: Active business license detection - ANY active license = operational
+    // Method 2: Active business license detection with expiration tracking
     for (const license of businessLicenses) {
       if (!license.address) continue;
       const status = license.status?.toUpperCase();
       const issueDate = parseDate(license.event_date);
+      
+      // Skip expired signals
+      if (issueDate) {
+        const ageInDays = getAgeInDays(issueDate);
+        if (ageInDays > 180) {
+          continue; // Skip expired signals
+        }
+      }
       
       if (status === 'AAC' || status === 'ACTIVE') {
         // Active business license issued > 30 days ago = operational
@@ -568,10 +907,20 @@ async function main() {
       }
     }
     
-    // Method 3: License history analysis - established patterns
+    // Method 3: License history analysis with expiration tracking
     const licenseByAddress = new Map<string, NormalizedRecord[]>();
     for (const lic of licensesAll) {
       if (!lic.address) continue;
+      
+      // Skip expired signals
+      const issueDate = parseDate(lic.event_date);
+      if (issueDate) {
+        const ageInDays = getAgeInDays(issueDate);
+        if (ageInDays > 180) {
+          continue; // Skip expired signals
+        }
+      }
+      
       const arr = licenseByAddress.get(lic.address) || [];
       arr.push(lic);
       licenseByAddress.set(lic.address, arr);
@@ -601,14 +950,18 @@ async function main() {
       }
     }
     
-    // Method 4: Recent food safety inspections (strong operational signal)
+    // Method 4: Recent food safety inspections with expiration tracking
     for (const inspection of inspections) {
       if (!inspection.address) continue;
       
       const inspectionDate = parseDate(inspection.event_date);
       if (!inspectionDate) continue;
       
+      // Skip expired signals
       const ageInDays = getAgeInDays(inspectionDate);
+      if (ageInDays > 180) {
+        continue; // Skip expired signals
+      }
       
       // Any food safety inspection within 90 days = operational
       const isFoodSafety = inspection.type?.toLowerCase().includes('food') || 
@@ -644,7 +997,7 @@ async function main() {
     // Create and score leads with enhanced filtering and concurrency control
     const leads: Lead[] = [];
     const limit = pLimit(5); // Limit concurrent LLM calls
-    const batchSize = 10;
+    const batchSize = 1000;
     
     let operationalFiltered = 0;
     let qualificationFiltered = 0;
@@ -718,12 +1071,89 @@ async function main() {
       qualified: leads.length
     });
     
+    // Enhanced duplicate detection if enabled
+    const useDuplicateDetection = process.env.LLM_DUPLICATE_DETECTION === 'true';
+    let deduplicatedLeads = leads;
+    
+    if (useDuplicateDetection && leads.length > 1) {
+      logger.info('Starting LLM-based duplicate detection...');
+      const duplicateGroups = new Map<number, number[]>();
+      const processedPairs = new Set<string>();
+      
+      // Compare all pairs of leads
+      for (let i = 0; i < leads.length; i++) {
+        for (let j = i + 1; j < leads.length; j++) {
+          const pairKey = `${i}-${j}`;
+          if (processedPairs.has(pairKey)) continue;
+          processedPairs.add(pairKey);
+          
+          try {
+            const lead1 = leads[i];
+            const lead2 = leads[j];
+            
+            if (!lead1 || !lead2 || !lead1.name || !lead2.name) continue;
+            
+            const duplicateAnalysis = await resolveBusinessEntity(
+              lead1.address,
+              lead1.name,
+              lead2.address,
+              lead2.name
+            );
+            
+            // If high confidence duplicate, group them
+            if (duplicateAnalysis.isSameBusiness && duplicateAnalysis.confidence > 80) {
+              logger.debug('Detected duplicate leads', {
+                lead1: { address: lead1.address, name: lead1.name },
+                lead2: { address: lead2.address, name: lead2.name },
+                confidence: duplicateAnalysis.confidence
+              });
+              
+              // Group duplicates (keep the higher scoring lead)
+              if (!duplicateGroups.has(i) && !duplicateGroups.has(j)) {
+                duplicateGroups.set(i, [j]);
+              } else if (duplicateGroups.has(i)) {
+                duplicateGroups.get(i)!.push(j);
+              } else if (duplicateGroups.has(j)) {
+                duplicateGroups.get(j)!.push(i);
+              }
+            }
+          } catch (error) {
+            logger.warn('Duplicate detection failed for pair', { i, j, error });
+          }
+        }
+      }
+      
+      // Remove duplicates (keep highest scoring lead from each group)
+      const indicesToRemove = new Set<number>();
+      for (const [primaryIndex, duplicateIndices] of duplicateGroups) {
+        for (const dupIndex of duplicateIndices) {
+          const primaryLead = leads[primaryIndex];
+          const dupLead = leads[dupIndex];
+          
+          if (!primaryLead || !dupLead) continue;
+          
+          // Keep the lead with higher score
+          if (primaryLead.score >= dupLead.score) {
+            indicesToRemove.add(dupIndex);
+          } else {
+            indicesToRemove.add(primaryIndex);
+          }
+        }
+      }
+      
+      deduplicatedLeads = leads.filter((_, index) => !indicesToRemove.has(index));
+      
+      if (indicesToRemove.size > 0) {
+        logger.info(`Removed ${indicesToRemove.size} duplicate leads via LLM analysis`);
+      }
+    }
+    
     // Sort leads by score (highest first)
-    leads.sort((a, b) => b.score - a.score);
+    deduplicatedLeads.sort((a, b) => b.score - a.score);
     
     // Store leads
     let storedCount = 0;
-    for (const lead of leads) {
+    for (const lead of deduplicatedLeads) {
       try {
         await storage.insertLead(lead);
         storedCount++;

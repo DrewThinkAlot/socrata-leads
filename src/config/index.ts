@@ -6,6 +6,7 @@ import { readFileSync, readdirSync } from 'fs';
 import { resolve } from 'path';
 import { parse as parseYaml } from 'yaml';
 import { validateCityConfig, type CityConfig } from './schema.js';
+import { getConfig } from './schema.js';
 import { ConfigError } from '../types.js';
 import { logger } from '../util/logger.js';
 

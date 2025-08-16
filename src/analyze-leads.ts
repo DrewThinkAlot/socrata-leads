@@ -308,8 +308,7 @@ async function main() {
     const analyses: EnhancedAnalysis[] = [];
     
     // Process each lead
-    for (let i = 0; i < topLeads.length; i++) {
-      const lead = topLeads[i];
+    for (const [i, lead] of topLeads.entries()) {
       logger.info(`Processing lead ${i + 1}/${topLeads.length}: ${lead.name || 'Unknown'}`);
       
       try {
@@ -335,13 +334,13 @@ async function main() {
         });
         
       } catch (error) {
-        logger.error(`Failed to analyze lead: ${lead.name}`, { error });
+        logger.error(`Failed to analyze lead: ${lead.name || 'Unknown'}`, { error });
       }
     }
     
     // Display results
     console.log('\n🚀 **ENHANCED GPT-5-mini LEAD ANALYSIS RESULTS**\n');
-    console.log('=' * 80);
+    console.log('='.repeat(80));
     
     analyses.forEach((analysis, index) => {
       const { lead, businessAnalysis, marketAnalysis, timingAnalysis, salesRecommendations } = analysis;

@@ -19,6 +19,7 @@ export interface SpotOnFilterConfig {
   timeline_window_days: [number, number];
   service_model_weights: Record<string, number>;
   operator_type_weights: Record<string, number>;
+  exclude_pop_up_vendors: boolean;
 }
 
 /**
@@ -52,7 +53,8 @@ export const DEFAULT_SPOTON_CONFIG: SpotOnFilterConfig = {
     'existing-operator': 1.2,
     'new-operator': 1.0,
     'unknown': 0.8
-  }
+  },
+  exclude_pop_up_vendors: true
 };
 
 /**
@@ -86,6 +88,27 @@ export async function analyzeSpotOnIntelligence(
   if (squareFootage !== undefined) intelligenceInput.square_footage = squareFootage;
   if (timelineDays !== undefined) intelligenceInput.opening_timeline_days = timelineDays;
 
+  // Check for pop-up vendor indicators
+  const isPopUpVendor = await detectPopUpVendor(allEvidence);
+  
+  // Skip processing if it's a pop-up vendor and exclusion is enabled
+  if (config.exclude_pop_up_vendors && isPopUpVendor) {
+    return {
+      business_category: determineBusinessCategory(allEvidence),
+      service_model: 'pop-up',
+      seat_capacity: 0,
+      square_footage: 0,
+      liquor_license_type: 'unknown',
+      reservation_systems: [],
+      kitchen_complexity: 'unknown',
+      operator_type: 'unknown',
+      spoton_score: 0,
+      is_pop_up_vendor: true,
+      filter_matches: []
+    };
+  }
+  
+  // Generate filter matches
   const filterMatches = await generateFilterMatches(intelligenceInput, config);
   
   // Calculate SpotOn score
@@ -94,19 +117,20 @@ export async function analyzeSpotOnIntelligence(
   return {
     business_category: determineBusinessCategory(allEvidence),
     service_model: serviceModel,
-    ...(seatCapacity !== undefined ? { seat_capacity: seatCapacity } : {}),
-    ...(squareFootage !== undefined ? { square_footage: squareFootage } : {}),
-    ...(liquorType !== undefined ? { liquor_license_type: liquorType } : {}),
+    seat_capacity: seatCapacity ?? 0,
+    square_footage: squareFootage ?? 0,
+    liquor_license_type: liquorType ?? 'unknown',
     reservation_systems: reservationSystems,
     kitchen_complexity: kitchenComplexity,
     operator_type: operatorType,
-    ...(timelineDays !== undefined ? { opening_timeline_days: timelineDays } : {}),
+    opening_timeline_days: timelineDays ?? 0,
     has_type_i_hood: await detectTypeIHood(allEvidence),
     has_multiple_cook_lines: await detectMultipleCookLines(allEvidence),
     has_hot_cold_stations: await detectHotColdStations(allEvidence),
     has_multiple_printers: await detectMultiplePrinters(allEvidence),
     spoton_score: spotonScore,
-    filter_matches: filterMatches
+    filter_matches: filterMatches,
+    is_pop_up_vendor: false
   };
 }
 
@@ -301,11 +325,23 @@ async function assessKitchenComplexity(records: NormalizedRecord[]): Promise<Spo
 async function detectOperatorType(records: NormalizedRecord[]): Promise<SpotOnBusinessIntelligence['operator_type']> {
   const descriptions = records.map(r => `${r.business_name || ''} ${r.description || ''}`).join(' ');
   
-  // Check for chain expansion
-  if (descriptions.includes('new location') || 
-      descriptions.includes('second location') || 
-      descriptions.includes('expansion') ||
-      descriptions.includes('franchise')) {
+  // Check for chain expansion with comprehensive franchise keywords
+  const franchiseKeywords = [
+    'new location', 'second location', 'third location', 'fourth location',
+    'expansion', 'franchise', 'franchisee', 'franchisor', 'chain',
+    'location opening', 'additional location', 'new branch', 'new site',
+    'new outlet', 'new store', 'new restaurant', 'new venue',
+    'multi-location', 'multiple locations', 'chain expansion', 'brand expansion',
+    'corporate location', 'company location', 'franchise location',
+    'mcdonald', 'subway', 'starbucks', 'taco bell', 'wendy', 'burger king',
+    'domino', 'pizza hut', 'kfc', 'chipotle', 'panera', 'dunkin', 'dunkin donuts'
+  ];
+  
+  const hasFranchiseIndicator = franchiseKeywords.some(keyword => 
+    descriptions.toLowerCase().includes(keyword)
+  );
+  
+  if (hasFranchiseIndicator) {
     return 'chain-expansion';
   }
   
@@ -392,6 +428,97 @@ function determineBusinessCategory(records: NormalizedRecord[]): string {
   if (descriptions.toLowerCase().includes('winery')) return 'Winery';
   
   return 'Other';
+}
+
+/**
+ * Detect pop-up vendor characteristics
+ */
+async function detectPopUpVendor(records: NormalizedRecord[]): Promise<boolean> {
+  const descriptions = records.map(r => 
+    `${r.business_name || ''} ${r.description || ''} ${r.type || ''}`
+  ).join(' ').toLowerCase();
+  
+  // Pop-up vendor indicators
+  const popUpIndicators = [
+    'pop-up',
+    'popup',
+    'temporary',
+    'food truck',
+    'mobile',
+    'vendor',
+    'stall',
+    'booth',
+    'market',
+    'festival',
+    'fair',
+    'cart',
+    'stand',
+    'kiosk',
+    'seasonal',
+    'weekend',
+    'special event',
+    'farmers market',
+    'street vendor',
+    'outdoor vendor'
+  ];
+  
+  // Check for pop-up indicators in descriptions
+  for (const indicator of popUpIndicators) {
+    if (descriptions.includes(indicator)) {
+      return true;
+    }
+  }
+  
+  // Check for business names that suggest pop-up nature
+  const businessNames = records.map(r => (r.business_name || '').toLowerCase());
+  const popUpBusinessNameIndicators = [
+    'pop-up',
+    'popup',
+    'food truck',
+    'mobile',
+    'vendor',
+    'stall',
+    'cart',
+    'kiosk',
+    'market'
+  ];
+  
+  for (const name of businessNames) {
+    for (const indicator of popUpBusinessNameIndicators) {
+      if (name && name.includes(indicator)) {
+        return true;
+      }
+    }
+  }
+  
+  // Check for very small capacity or temporary setups
+  const capacityMatch = descriptions.match(/(\d+)\s*(?:seat|seats|capacity|person)/i);
+  if (capacityMatch) {
+    const capacity = parseInt(capacityMatch[1]!, 10);
+    if (capacity <= 5) {
+      return true;
+    }
+  }
+  
+  // Check for temporary or mobile permits
+  const temporaryPermitTypes = [
+    'temporary food',
+    'mobile food',
+    'street vendor',
+    'special event',
+    'seasonal permit'
+  ];
+  
+  for (const record of records) {
+    const type = (record.type || '').toLowerCase();
+    for (const permitType of temporaryPermitTypes) {
+      if (type.includes(permitType)) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
 }
 
 /**

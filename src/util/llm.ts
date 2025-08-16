@@ -26,6 +26,11 @@ const CFG = {
   LLM_MAX_RETRIES: num(process.env.LLM_MAX_RETRIES, 3),
   LLM_DISK_CACHE_DIR: process.env.LLM_DISK_CACHE_DIR || '.cache/llm',
   LLM_CACHE_TTL_MS: num(process.env.LLM_CACHE_TTL_MS, 300_000), // 5m
+  // Enhanced LLM Features
+  LLM_ENHANCED_FILTERING: (process.env.LLM_ENHANCED_FILTERING ?? 'false').toLowerCase() === 'true',
+  LLM_DUPLICATE_DETECTION: (process.env.LLM_DUPLICATE_DETECTION ?? 'false').toLowerCase() === 'true',
+  LLM_DYNAMIC_SCORING: (process.env.LLM_DYNAMIC_SCORING ?? 'false').toLowerCase() === 'true',
+  LLM_CONTACT_EXTRACTION: (process.env.LLM_CONTACT_EXTRACTION ?? 'false').toLowerCase() === 'true',
 };
 
 function num(v: string | undefined, d: number) { const n = Number(v); return Number.isFinite(n) ? n : d; }
@@ -73,16 +78,38 @@ async function toDisk(key: string, r: any) {
 // -------------------------
 // LLM core
 // -------------------------
+function sampleAccept(sampleKey: string): boolean {
+  // Deterministic sampling based on hashed key so repeated runs are stable
+  try {
+    const h = Number(hashKey(sampleKey)) % 1000; // 0..999
+    const threshold = Math.round(CFG.LLM_SAMPLE_RATE * 1000); // 0..1000
+    return h < threshold;
+  } catch {
+    // Fallback to random if hashing fails
+    return Math.random() < CFG.LLM_SAMPLE_RATE;
+  }
+}
+
 function shouldUseLLM(sampleKey: string) {
-  // Always use the LLM when an API key is present. Ignore sampling and per-run call caps.
-  return !!CFG.OPENAI_API_KEY;
+  if (!CFG.LLM_ENABLED) return false;
+  if (!CFG.OPENAI_API_KEY) return false;
+  if (CFG.LLM_MAX_CALLS_PER_RUN > 0 && callsThisRun >= CFG.LLM_MAX_CALLS_PER_RUN) return false;
+  if (CFG.LLM_SAMPLE_RATE < 1) return sampleAccept(sampleKey);
+  return true;
 }
 
 export interface OpenAIRequestOptions {
-  model?: string; temperature?: number; max_tokens?: number; timeout?: number; force_json?: boolean;
+  model?: string;
+  temperature?: number;
+  max_tokens?: number;
+  timeout?: number;
+  force_json?: boolean;
 }
 export interface OpenAIResponse {
-  choices: Array<{ message: { role: string; content: string } }>; usage?: any; id?: string; model?: string;
+  choices: Array<{ message: { role: string; content: string } }>;
+  usage?: any;
+  id?: string;
+  model?: string;
 }
 
 async function callOpenAI(
@@ -221,7 +248,6 @@ async function llmTask<T>({
   const d = await fromDisk(key); if (d) { toMem(key, d); return d; }
 
   if (!shouldUseLLM(sampleKey || key)) { const res = fallback(); toMem(key, res); await toDisk(key, res); return res; }
-  if (!CFG.OPENAI_API_KEY) { logger.warn('OPENAI_API_KEY missing, using fallback'); const res = fallback(); toMem(key, res); await toDisk(key, res); return res; }
 
   if (inFlight.has(key)) return inFlight.get(key)!;
 
@@ -427,6 +453,7 @@ export async function analyzeDescription(description: string, businessName?: str
       let businessType: string | undefined;
       let keyFeatures: string[] | undefined;
       let confidence: number | undefined;
+      
       if (j && typeof j === 'object') {
         businessType = j.businessType || j.category || j.type;
         const features = j.keyFeatures || j.features || j.tags || j.attributes || j.traits;
@@ -437,20 +464,25 @@ export async function analyzeDescription(description: string, businessName?: str
           if (Number.isFinite(n)) confidence = n;
         }
       }
+      
       if (!businessType) {
         // Try to extract from plain text
         const m = String(raw || '').match(/businessType\s*[:=]\s*([^\n\r]+)/i);
         if (m?.[1]) businessType = m[1].trim().replace(/^"|"$/g, '');
       }
+      
       if (!keyFeatures) {
         const m = String(raw || '').match(/keyFeatures\s*[:=]\s*\[([^\]]+)\]/i);
         if (m?.[1]) keyFeatures = m[1].split(',').map(s => s.replace(/^[\s\"]+|[\s\"]+$/g, '')).filter(Boolean);
       }
+      
       if (!Number.isFinite(confidence as number)) {
         const m = String(raw || '').match(/confidence\s*[:=]\s*([0-9]{1,3})/i);
         if (m?.[1]) confidence = Number(m[1]);
       }
+      
       if (!businessType) return null;
+      
       const bt = String(businessType);
       const feats = (keyFeatures || []).slice(0, 3);
       const conf = clamp(Number(confidence ?? 70), 0, 100);
@@ -458,6 +490,574 @@ export async function analyzeDescription(description: string, businessName?: str
     },
     fallback: () => ({ ...analyzeDescriptionFallback(description), source: 'fallback' }),
     opts: { temperature: 0.2, max_tokens: 320, force_json: true },
+  });
+}
+
+// -------------------------
+// Project stage classification
+// -------------------------
+const PROJECT_STAGES = [
+  'Planning',
+  'Pre-Opening', 
+  'Soft Opening',
+  'Grand Opening',
+  'Operational'
+] as const;
+export type ProjectStage = typeof PROJECT_STAGES[number];
+
+function stageFallback(description: string, permitTypes: string[]): ProjectStage {
+  const desc = description.toLowerCase();
+  const permits = permitTypes.join(' ').toLowerCase();
+  
+  // Restaurant-specific early stage indicators
+  if (desc.includes('plan') || desc.includes('proposal') || desc.includes('concept') || 
+      permits.includes('plan') || permits.includes('zoning') || permits.includes('variance') ||
+      permits.includes('conditional use') || permits.includes('master use')) {
+    return 'Planning';
+  }
+  
+  // Construction/renovation phase with restaurant-specific signals
+  if (desc.includes('build') || desc.includes('construct') || desc.includes('renov') ||
+      permits.includes('build') || permits.includes('construct') || permits.includes('alter') ||
+      permits.includes('tenant improvement') || permits.includes('mechanical') || 
+      permits.includes('electrical') || permits.includes('plumbing') ||
+      desc.includes('kitchen') || desc.includes('hood') || desc.includes('ventilation')) {
+    return 'Pre-Opening';
+  }
+  
+  // Near opening indicators with restaurant-specific equipment and utility signals
+  if (desc.includes('soft') || desc.includes('trial') || desc.includes('preview') ||
+      permits.includes('health') || permits.includes('food') ||
+      desc.includes('equipment') || desc.includes('installation') || desc.includes('final') ||
+      desc.includes('inspection') || desc.includes('training') || desc.includes('staff') ||
+      desc.includes('water service') || desc.includes('gas connection') || desc.includes('utility hookup') ||
+      permits.includes('water service') || permits.includes('electrical')) {
+    return 'Soft Opening';
+  }
+  
+  // Grand opening indicators
+  if (desc.includes('grand') || desc.includes('launch') || desc.includes('open') ||
+      desc.includes('ready to open')) {
+    return 'Grand Opening';
+  }
+  
+  return 'Operational';
+}
+
+export async function classifyProjectStage(
+  description: string, 
+  businessName?: string,
+  permitTypes?: string[],
+  issueDate?: string
+): Promise<{ stage: ProjectStage; confidence: number; source: 'llm' | 'fallback' }> {
+  const permitContext = permitTypes?.length ? `Permit Types: ${permitTypes.join(', ')}` : '';
+  const dateContext = issueDate ? `Issue Date: ${issueDate}` : '';
+  
+  return llmTask<{ stage: ProjectStage; confidence: number; source: 'llm' | 'fallback' }>({
+    name: 'classifyProjectStage',
+    keyParts: [description, businessName, permitTypes?.join(','), issueDate],
+    sampleKey: hashKey(description, businessName ?? ''),
+    messages: [
+      { role: 'system', content: 'You are an expert business analyst specializing in restaurant and retail development timelines. Return JSON only.' },
+      { role: 'user', content: `Return JSON only with fields stage and confidence (0-100). Stage must be one of: ${PROJECT_STAGES.join(', ')}. 
+Business Name: ${businessName ?? ''}
+Description: ${description}
+${permitContext}
+${dateContext}
+
+Classify the current project stage based on business description, permit types, and timeline context.` },
+    ],
+    parse: (raw) => {
+      const j = parseFirstJson(raw) as any;
+      let stage: string | undefined;
+      let confidence: number | undefined;
+      
+      if (j && typeof j === 'object') {
+        stage = j.stage || j.projectStage || j.phase || j.status;
+        confidence = j.confidence || j.confidenceScore || j.score;
+      }
+      
+      if (!stage) {
+        const m = String(raw || '').match(/stage\s*[:=]\s*([^\n]+)/i);
+        if (m?.[1]) stage = m[1].trim().replace(/^"|"$/g, '');
+      }
+      
+      if (!stage) return null;
+      
+      const normalizedStage = PROJECT_STAGES.includes(stage as ProjectStage) 
+        ? stage as ProjectStage 
+        : stageFallback(description, permitTypes || []);
+      
+      const conf = clamp(Number(confidence ?? 75), 0, 100);
+      return { stage: normalizedStage, confidence: conf, source: 'llm' as const };
+    },
+    fallback: () => ({ 
+      stage: stageFallback(description, permitTypes || []), 
+      confidence: 60, 
+      source: 'fallback' 
+    }),
+    opts: { temperature: 0.15, max_tokens: 80, force_json: true },
+  });
+}
+
+// -------------------------
+// Days remaining estimation
+// -------------------------
+// Restaurant-specific stage duration estimates based on industry research
+const RESTAURANT_STAGE_DAYS_REMAINING = {
+  'fast-food': {
+    Planning: { min: 60, max: 180, avg: 90 },
+    'Pre-Opening': { min: 21, max: 84, avg: 56 },  // 8-12 weeks construction
+    'Soft Opening': { min: 3, max: 14, avg: 7 },
+    'Grand Opening': { min: 0, max: 5, avg: 2 },
+    Operational: { min: 0, max: 0, avg: 0 }
+  },
+  'fast-casual': {
+    Planning: { min: 90, max: 270, avg: 120 },
+    'Pre-Opening': { min: 42, max: 112, avg: 77 },  // 10-16 weeks construction
+    'Soft Opening': { min: 7, max: 21, avg: 14 },
+    'Grand Opening': { min: 0, max: 7, avg: 3 },
+    Operational: { min: 0, max: 0, avg: 0 }
+  },
+  'full-service': {
+    Planning: { min: 120, max: 365, avg: 210 },
+    'Pre-Opening': { min: 84, max: 168, avg: 140 }, // 20-24 weeks construction
+    'Soft Opening': { min: 14, max: 42, avg: 21 },
+    'Grand Opening': { min: 0, max: 14, avg: 7 },
+    Operational: { min: 0, max: 0, avg: 0 }
+  },
+  'unknown': {
+    Planning: { min: 90, max: 365, avg: 180 },
+    'Pre-Opening': { min: 30, max: 120, avg: 60 },
+    'Soft Opening': { min: 7, max: 30, avg: 14 },
+    'Grand Opening': { min: 0, max: 7, avg: 3 },
+    Operational: { min: 0, max: 0, avg: 0 }
+  }
+};
+
+function estimateDaysRemainingFallback(stage: ProjectStage, permitTypes: string[], issueDate?: string, restaurantType: string = 'unknown'): number {
+  // Determine restaurant type from permit types if not provided
+  let detectedType = restaurantType;
+  if (detectedType === 'unknown') {
+    const permits = permitTypes.join(' ').toLowerCase();
+    if (permits.includes('drive') || permits.includes('quick') || permits.includes('fast food')) {
+      detectedType = 'fast-food';
+    } else if (permits.includes('full bar') || permits.includes('liquor') || permits.includes('wine')) {
+      detectedType = 'full-service';
+    } else if (permits.includes('casual') || permits.includes('counter')) {
+      detectedType = 'fast-casual';
+    }
+  }
+  
+  const stageData = RESTAURANT_STAGE_DAYS_REMAINING[detectedType as keyof typeof RESTAURANT_STAGE_DAYS_REMAINING] || 
+                   RESTAURANT_STAGE_DAYS_REMAINING.unknown;
+  const currentStageData = stageData[stage];
+  
+  // Adjust based on permit types and complexity
+  let multiplier = 1.0;
+  const permits = permitTypes.join(' ').toLowerCase();
+  
+  // Construction complexity adjustments
+  if (permits.includes('build') || permits.includes('construct')) {
+    multiplier = detectedType === 'full-service' ? 1.3 : 1.2;
+  }
+  if (permits.includes('tenant improvement') || permits.includes('renovation')) {
+    multiplier *= 0.8; // Renovations are typically faster
+  }
+  
+  // Late-stage signals reduce timeline
+  if (permits.includes('health') || permits.includes('final')) {
+    multiplier *= 0.6;
+  }
+  if (permits.includes('equipment') || permits.includes('installation')) {
+    multiplier *= 0.4; // Very close to opening
+  }
+  if (permits.includes('water service') || permits.includes('utility') || permits.includes('gas') || permits.includes('electrical')) {
+    multiplier *= 0.3; // Utilities being connected - imminent opening
+  }
+  
+  // Early-stage signals extend timeline
+  if (permits.includes('plan') || permits.includes('zoning') || permits.includes('variance')) {
+    multiplier *= 1.8;
+  }
+  
+  // Seasonal adjustment
+  const currentMonth = new Date().getMonth() + 1;
+  if (currentMonth >= 1 && currentMonth <= 3) multiplier *= 1.2; // Winter delays
+  if (currentMonth >= 10 && currentMonth <= 12) multiplier *= 1.3; // Holiday delays
+  
+  // Adjust based on issue date recency
+  if (issueDate) {
+    try {
+      const issue = new Date(issueDate);
+      const daysSince = Math.floor((Date.now() - issue.getTime()) / (1000 * 60 * 60 * 24));
+      
+      // Reduce estimates for older permits (progress likely made)
+      if (stage === 'Planning' && daysSince > 120) multiplier *= 0.7;
+      if (stage === 'Pre-Opening' && daysSince > 60) multiplier *= 0.6;
+      if (stage === 'Soft Opening' && daysSince > 21) multiplier *= 0.4;
+    } catch {
+      // Invalid date, use default
+    }
+  }
+  
+  return Math.round(currentStageData.avg * multiplier);
+}
+
+export async function estimateDaysRemaining(
+  stage: ProjectStage,
+  description: string,
+  permitTypes?: string[],
+  issueDate?: string,
+  businessName?: string
+): Promise<{ daysRemaining: number; confidence: number; source: 'llm' | 'fallback' }> {
+  const permitContext = permitTypes?.length ? `Permit Types: ${permitTypes.join(', ')}` : '';
+  const dateContext = issueDate ? `Issue Date: ${issueDate}` : '';
+  
+  // Detect restaurant type for enhanced context
+  const combinedText = `${businessName || ''} ${description}`.toLowerCase();
+  let restaurantType = 'unknown';
+  if (combinedText.includes('fast food') || combinedText.includes('drive') || combinedText.includes('quick')) {
+    restaurantType = 'fast-food';
+  } else if (combinedText.includes('fine dining') || combinedText.includes('full service') || combinedText.includes('wine')) {
+    restaurantType = 'full-service';
+  } else if (combinedText.includes('casual') || combinedText.includes('counter') || combinedText.includes('fresh')) {
+    restaurantType = 'fast-casual';
+  }
+  
+  return llmTask<{ daysRemaining: number; confidence: number; source: 'llm' | 'fallback' }>({
+    name: 'estimateDaysRemaining',
+    keyParts: [stage, description, businessName, permitTypes?.join(','), issueDate, restaurantType],
+    sampleKey: hashKey(stage, description),
+    messages: [
+      { role: 'system', content: 'You are an expert restaurant development timeline analyst with knowledge of industry-specific construction and permitting phases. Return JSON only.' },
+      { role: 'user', content: `Return JSON only with fields daysRemaining and confidence (0-100).
+Project Stage: ${stage}
+Restaurant Type: ${restaurantType}
+Business Name: ${businessName ?? ''}
+Description: ${description}
+${permitContext}
+${dateContext}
+
+Estimate days until grand opening based on restaurant-specific timelines:
+- Fast-food: 8-12 weeks construction
+- Fast-casual: 10-16 weeks construction  
+- Full-service: 20-24 weeks construction
+
+Consider permit sequence: Planning → Construction → Equipment → Final Inspections → Opening` },
+    ],
+    parse: (raw) => {
+      const j = parseFirstJson(raw) as any;
+      let daysRemaining: number | undefined;
+      let confidence: number | undefined;
+      
+      if (j && typeof j === 'object') {
+        if (typeof j.daysRemaining === 'number') daysRemaining = j.daysRemaining;
+        if (typeof j.days_remaining === 'number') daysRemaining = j.days_remaining;
+        if (typeof j.estimatedDays === 'number') daysRemaining = j.estimatedDays;
+        
+        if (typeof j.confidence === 'number') confidence = j.confidence;
+        if (typeof j.confidence === 'string') {
+          const n = Number(j.confidence.replace(/[^0-9.]+/g, ''));
+          if (Number.isFinite(n)) confidence = n;
+        }
+      }
+      
+      if (daysRemaining === undefined) {
+        const m = String(raw || '').match(/days(?:\s*remaining)?\s*[:=]\s*(\d+)/i);
+        if (m?.[1]) daysRemaining = Number(m[1]);
+      }
+      
+      if (daysRemaining === undefined) return null;
+      
+      const days = Math.max(0, Math.round(daysRemaining));
+      const conf = clamp(Number(confidence ?? 75), 0, 100);
+      return { daysRemaining: days, confidence: conf, source: 'llm' as const };
+    },
+    fallback: () => ({ 
+      daysRemaining: estimateDaysRemainingFallback(stage, permitTypes || [], issueDate, restaurantType), 
+      confidence: 70, 
+      source: 'fallback' 
+    }),
+    opts: { temperature: 0.15, max_tokens: 80, force_json: true },
+  });
+}
+
+// -------------------------
+// Enhanced LLM Functions for Efficiency
+// -------------------------
+
+/**
+ * Detect if a business is currently operational or still pre-opening
+ */
+export async function detectOperationalStatus(
+  description: string,
+  permitTypes: string[],
+  businessName?: string,
+  issueDate?: string
+): Promise<{ isOperational: boolean; confidence: number; source: 'llm' | 'fallback' }> {
+  const permitContext = permitTypes.length ? `Permit Types: ${permitTypes.join(', ')}` : '';
+  const dateContext = issueDate ? `Issue Date: ${issueDate}` : '';
+  
+  return llmTask<{ isOperational: boolean; confidence: number; source: 'llm' | 'fallback' }>({
+    name: 'detectOperationalStatus',
+    keyParts: [description, permitTypes.join(','), businessName, issueDate],
+    sampleKey: hashKey(description, businessName ?? ''),
+    messages: [
+      { 
+        role: 'system', 
+        content: 'You are a business analyst expert at detecting whether a restaurant is currently operational or still in pre-opening phase based on permit descriptions, business context, and timeline indicators. Return JSON only.' 
+      },
+      { 
+        role: 'user', 
+        content: `Analyze if this business is currently operational or still pre-opening. Return JSON: {"isOperational": boolean, "confidence": 0-100}.
+
+Business Name: ${businessName ?? ''}
+Description: ${description}
+${permitContext}
+${dateContext}
+
+Consider:
+- Language patterns (renewal, transfer, re-inspection = operational)
+- New construction, buildout, grand opening = pre-opening
+- Permit sequence and timing
+- Business name patterns (established vs new)` 
+      },
+    ],
+    parse: (raw) => {
+      const j = parseFirstJson(raw) as any;
+      if (j && typeof j === 'object') {
+        const isOperational = Boolean(j.isOperational ?? j.operational ?? j.is_operational);
+        const confidence = clamp(Number(j.confidence ?? 75), 0, 100);
+        return { isOperational, confidence, source: 'llm' as const };
+      }
+      return null;
+    },
+    fallback: () => {
+      // Fallback logic based on patterns
+      const desc = description.toLowerCase();
+      const permits = permitTypes.join(' ').toLowerCase();
+      
+      const operationalPatterns = ['renewal', 'transfer', 'change of ownership', 're-inspection', 'maintenance', 'repair', 'annual', 'routine', 'existing', 'current', 'established'];
+      const preOpeningPatterns = ['grand opening', 'opening soon', 'new location', 'build-out', 'tenant improvement', 'new restaurant', 'coming soon', 'under construction', 'now hiring'];
+      
+      const operationalScore = operationalPatterns.filter(p => desc.includes(p) || permits.includes(p)).length;
+      const preOpeningScore = preOpeningPatterns.filter(p => desc.includes(p) || permits.includes(p)).length;
+      
+      return { 
+        isOperational: operationalScore > preOpeningScore, 
+        confidence: Math.min(80, Math.max(40, (Math.abs(operationalScore - preOpeningScore) + 1) * 20)), 
+        source: 'fallback' as const 
+      };
+    },
+    opts: { temperature: 0.1, max_tokens: 60, force_json: true },
+  });
+}
+
+/**
+ * Resolve if two business records represent the same entity
+ */
+export async function resolveBusinessEntity(
+  address1: string,
+  businessName1: string,
+  address2: string,
+  businessName2: string
+): Promise<{ isSameBusiness: boolean; confidence: number; source: 'llm' | 'fallback' }> {
+  return llmTask<{ isSameBusiness: boolean; confidence: number; source: 'llm' | 'fallback' }>({
+    name: 'resolveBusinessEntity',
+    keyParts: [address1, businessName1, address2, businessName2],
+    sampleKey: hashKey(address1, businessName1),
+    messages: [
+      { 
+        role: 'system', 
+        content: 'You are an expert at determining if two business records refer to the same physical restaurant location, accounting for address variations, business name changes, and franchise relationships. Return JSON only.' 
+      },
+      { 
+        role: 'user', 
+        content: `Compare these two business records and determine if they represent the same restaurant location. Return JSON: {"isSameBusiness": boolean, "confidence": 0-100}.
+
+Record 1:
+Address: ${address1}
+Business Name: ${businessName1}
+
+Record 2:
+Address: ${address2}
+Business Name: ${businessName2}
+
+Consider:
+- Address variations (abbreviations, suite numbers, formatting)
+- Business name changes, DBA relationships
+- Franchise vs corporate naming
+- Same physical location indicators` 
+      },
+    ],
+    parse: (raw) => {
+      const j = parseFirstJson(raw) as any;
+      if (j && typeof j === 'object') {
+        const isSameBusiness = Boolean(j.isSameBusiness ?? j.same_business ?? j.is_same);
+        const confidence = clamp(Number(j.confidence ?? 50), 0, 100);
+        return { isSameBusiness, confidence, source: 'llm' as const };
+      }
+      return null;
+    },
+    fallback: () => {
+      // Simple fallback: exact address match or very similar names
+      const addr1Clean = address1.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const addr2Clean = address2.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const name1Clean = businessName1.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const name2Clean = businessName2.toLowerCase().replace(/[^a-z0-9]/g, '');
+      
+      const addressMatch = addr1Clean === addr2Clean;
+      const nameMatch = name1Clean === name2Clean;
+      const nameSimilar = name1Clean.includes(name2Clean) || name2Clean.includes(name1Clean);
+      
+      if (addressMatch && (nameMatch || nameSimilar)) {
+        return { isSameBusiness: true, confidence: 90, source: 'fallback' as const };
+      }
+      if (addressMatch) {
+        return { isSameBusiness: true, confidence: 70, source: 'fallback' as const };
+      }
+      return { isSameBusiness: false, confidence: 60, source: 'fallback' as const };
+    },
+    opts: { temperature: 0.1, max_tokens: 80, force_json: true },
+  });
+}
+
+/**
+ * Extract contact information from unstructured text
+ */
+export async function extractContactInfoLLM(
+  description: string,
+  businessName?: string
+): Promise<{
+  phone?: string;
+  email?: string;
+  website?: string;
+  contactPerson?: string;
+  source: 'llm' | 'fallback';
+}> {
+  return llmTask<{
+    phone?: string;
+    email?: string;
+    website?: string;
+    contactPerson?: string;
+    source: 'llm' | 'fallback';
+  }>({
+    name: 'extractContactInfoLLM',
+    keyParts: [description, businessName],
+    sampleKey: hashKey(description),
+    messages: [
+      { 
+        role: 'system', 
+        content: 'You are an expert at extracting contact information from business descriptions and permit text. Return JSON only with properly formatted contact details.' 
+      },
+      { 
+        role: 'user', 
+        content: `Extract all contact information from this text. Return JSON: {"phone": "string", "email": "string", "website": "string", "contactPerson": "string"}. Include only valid, properly formatted contact details. Omit fields if not found.
+
+Business Name: ${businessName ?? ''}
+Description: ${description}
+
+Format phone numbers as (XXX) XXX-XXXX. Validate email addresses. Extract full names for contact persons.` 
+      },
+    ],
+    parse: (raw) => {
+      const j = parseFirstJson(raw) as any;
+      if (j && typeof j === 'object') {
+        const result: any = { source: 'llm' as const };
+        
+        if (typeof j.phone === 'string' && j.phone.trim()) result.phone = j.phone.trim();
+        if (typeof j.email === 'string' && j.email.trim() && j.email.includes('@')) result.email = j.email.trim();
+        if (typeof j.website === 'string' && j.website.trim()) result.website = j.website.trim();
+        if (typeof j.contactPerson === 'string' && j.contactPerson.trim()) result.contactPerson = j.contactPerson.trim();
+        
+        return result;
+      }
+      return null;
+    },
+    fallback: () => {
+      // Basic regex extraction
+      const result: any = { source: 'fallback' as const };
+      const text = `${businessName ?? ''} ${description}`;
+      
+      const phoneMatch = text.match(/\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/);
+      if (phoneMatch) result.phone = phoneMatch[0];
+      
+      const emailMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+      if (emailMatch) result.email = emailMatch[0];
+      
+      const websiteMatch = text.match(/https?:\/\/[^\s]+|www\.[^\s]+/);
+      if (websiteMatch) result.website = websiteMatch[0];
+      
+      return result;
+    },
+    opts: { temperature: 0.1, max_tokens: 150, force_json: true },
+  });
+}
+
+/**
+ * Calculate dynamic lead score based on business context
+ */
+export async function calculateDynamicLeadScore(
+  events: any[],
+  staticScore: number
+): Promise<{ 
+  score: number; 
+  factors: Record<string, number>; 
+  adjustments: string[];
+  source: 'llm' | 'fallback';
+}> {
+  const combinedContext = events.map(e => 
+    `${e.description || ''} ${e.name || ''} ${e.type || ''}`
+  ).join(' ').substring(0, 1000); // Limit context length
+  
+  return llmTask<{ 
+    score: number; 
+    factors: Record<string, number>; 
+    adjustments: string[];
+    source: 'llm' | 'fallback';
+  }>({
+    name: 'calculateDynamicLeadScore',
+    keyParts: [combinedContext, staticScore],
+    sampleKey: hashKey(combinedContext.substring(0, 200)),
+    messages: [
+      { 
+        role: 'system', 
+        content: 'You are an expert lead qualification analyst for restaurant sales. Analyze lead quality and provide scoring adjustments based on business context. Return JSON only.' 
+      },
+      { 
+        role: 'user', 
+        content: `Analyze this restaurant lead and provide quality scoring. Return JSON: {"score": 0-100, "factors": {"recency": weight, "intent": weight, "contact": weight, "timeline": weight, "complexity": weight}, "adjustments": ["reason1", "reason2"]}.
+
+Current Static Score: ${staticScore}
+Business Context: ${combinedContext}
+
+Consider:
+- Business type and complexity (full-service > fast-casual > fast-food)
+- Opening timeline and stage indicators
+- Contact information availability
+- Market opportunity signals
+- Permit complexity and sequence` 
+      },
+    ],
+    parse: (raw) => {
+      const j = parseFirstJson(raw) as any;
+      if (j && typeof j === 'object') {
+        const score = clamp(Number(j.score ?? staticScore), 0, 100);
+        const factors = (j.factors && typeof j.factors === 'object') ? j.factors : {};
+        const adjustments = Array.isArray(j.adjustments) ? j.adjustments.filter((a: any) => typeof a === 'string') : [];
+        
+        return { score, factors, adjustments, source: 'llm' as const };
+      }
+      return null;
+    },
+    fallback: () => ({
+      score: staticScore,
+      factors: { recency: 0.3, intent: 0.25, contact: 0.2, timeline: 0.15, complexity: 0.1 },
+      adjustments: ['Using static scoring fallback'],
+      source: 'fallback' as const
+    }),
+    opts: { temperature: 0.2, max_tokens: 200, force_json: true },
   });
 }
 
@@ -489,5 +1089,3 @@ export function initializeLLM() {
   if (!CFG.OPENAI_API_KEY) logger.warn('OPENAI_API_KEY not set. Falling back to heuristics.');
   else logger.info('LLM utilities ready');
 }
-
-// removed duplicate export to avoid conflicts with interface exports above

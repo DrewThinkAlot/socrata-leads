@@ -5,7 +5,7 @@
  */
 
 import { config } from 'dotenv';
-import { parseArgs } from 'util';
+import { parseArgs } from 'node:util';
 import { loadCityConfig } from '../config/index.js';
 import { createStorage } from '../storage/index.js';
 import { logger } from '../util/logger.js';
@@ -14,6 +14,9 @@ import { parseDate, formatDateTimeISO } from '../util/dates.js';
 import { categorizeBusinessType, analyzeDescription } from '../util/llm.js';
 import { randomUUID } from 'crypto';
 import pLimit from 'p-limit';
+import { Storage } from '../storage/index.js';
+// normalizeRecord is defined in this file
+import { getConfig } from '../config/schema.js';
 
 // Load environment variables
 config();
@@ -32,6 +35,22 @@ function parseCliArgs() {
       dataset: {
         type: 'string',
         short: 'd',
+      },
+      fast: {
+        type: 'boolean',
+        short: 'f',
+      },
+      workers: {
+        type: 'string',
+        short: 'w',
+      },
+      batchSize: {
+        type: 'string',
+        short: 'b',
+      },
+      resume: {
+        type: 'boolean',
+        short: 'r',
       },
       help: {
         type: 'boolean',
@@ -64,7 +83,28 @@ Examples:
   return {
     city: values.city as string,
     dataset: values.dataset as string | undefined,
+    fastMode: values.fast as boolean,
+    workers: parseInt(values.workers as string) || 2,
+    batchSize: parseInt(values.batchSize as string) || 5000,
+    resume: values.resume as boolean,
   };
+}
+
+/**
+ * Check if record is restaurant-related for selective LLM processing
+ */
+function isRestaurantRecord(rawRecord: any): boolean {
+  const businessType = rawRecord.business_type?.toLowerCase() || '';
+  const description = rawRecord.description?.toLowerCase() || '';
+  const name = rawRecord.business_name?.toLowerCase() || '';
+  
+  const restaurantKeywords = [
+    'restaurant', 'cafe', 'bar', 'grill', 'kitchen', 'diner', 'bistro', 'pub',
+    'tavern', 'bakery', 'pizzeria', 'deli', 'sandwich', 'food', 'eatery'
+  ];
+  
+  const combinedText = `${businessType} ${description} ${name}`;
+  return restaurantKeywords.some(keyword => combinedText.includes(keyword));
 }
 
 /**
@@ -236,27 +276,46 @@ async function main() {
     
     logger.info(`Found ${rawRecords.length} raw records to normalize`);
     
-    // Limit concurrency to prevent API overload
-    const limit = pLimit(2); // Max 2 concurrent LLM calls to avoid rate limits
-    const batchSize = 100;
+    const CFG = getConfig();
+    
+    // Log configuration for debugging
+    logger.info('Configuration', {
+      fastMode: args.fastMode,
+      workers: args.workers,
+      batchSize: args.batchSize,
+      LLM_ENABLED: CFG.LLM_ENABLED
+    });
+    // Dynamic configuration based on mode
+    const useLLM = !args.fastMode && CFG.LLM_ENABLED;
+    const workers = args.workers;
+    const batchSize = args.batchSize;
+    
+    // Separate limits for LLM vs non-LLM operations
+    const llmLimit = pLimit(useLLM ? 2 : 1); // LLM calls (minimum 1)
+    const cpuLimit = pLimit(Math.max(1, workers)); // CPU-bound operations (minimum 1)
+    
     let normalizedCount = 0;
     let errors = 0;
     const startTime = Date.now();
     
-    // Process records in batches
-    for (let i = 0; i < rawRecords.length; i += batchSize) {
+    // Process records in batches with streaming for large datasets
+    const totalRecords = rawRecords.length;
+    
+    let startOffset = 0;
+    
+    for (let i = startOffset; i < totalRecords; i += batchSize) {
       const batch = rawRecords.slice(i, i + batchSize);
       const batchNumber = Math.floor(i / batchSize) + 1;
-      const totalBatches = Math.ceil(rawRecords.length / batchSize);
+      const totalBatches = Math.ceil(totalRecords / batchSize);
       
       logger.info(`Processing batch ${batchNumber}/${totalBatches} (${batch.length} records)`);
       
       const batchStartTime = Date.now();
       
-      // Process batch with concurrency limit
+      // Process batch with optimized concurrency
       const results = await Promise.allSettled(
         batch.map(rawRecord => 
-          limit(async () => {
+          cpuLimit(async () => {
             try {
               const datasetConfig = cityConfig.datasets[rawRecord.dataset];
               if (!datasetConfig) {
@@ -264,11 +323,25 @@ async function main() {
                 return null;
               }
               
-              // Normalize the record
-              const normalized = await normalizeRecord(rawRecord, cityConfig, datasetConfig);
+              // Skip LLM processing in fast mode
+              let normalized;
+              if (useLLM && isRestaurantRecord(rawRecord)) {
+                normalized = await llmLimit(async () => 
+                  normalizeRecord(rawRecord, cityConfig, datasetConfig)
+                );
+              } else {
+                // Fast mode - skip LLM calls
+                normalized = await normalizeRecord(rawRecord, cityConfig, datasetConfig);
+              }
               
               // Store normalized record
               await storage.insertNormalized(normalized);
+              
+              // Update progress checkpoint
+              if ((i + batch.indexOf(rawRecord)) % 1000 === 0) {
+                logger.info(`Progress checkpoint: ${i + batch.indexOf(rawRecord)}/${totalRecords}`);
+              }
+              
               return normalized;
             } catch (error) {
               logger.error('Failed to normalize record', {
@@ -323,9 +396,16 @@ async function main() {
     await storage.close();
     
     process.exit(0);
-    
   } catch (error) {
-    logger.error('Data normalization failed', { error, args });
+    logger.error('Data normalization failed', { 
+      error: error instanceof Error ? {
+        message: error.message,
+        stack: error.stack,
+        name: error.name
+      } : error,
+      args 
+    });
+    await storage.close();
     process.exit(1);
   }
 }
