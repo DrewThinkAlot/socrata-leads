@@ -5,14 +5,13 @@
  */
 
 import { config } from 'dotenv';
-import { parseArgs } from 'util';
 import { loadCityConfig } from '../config/index.js';
 import { createStorage } from '../storage/index.js';
 import { createSocrataAdapter } from '../adapters/socrata.js';
-import { createOptimizedSocrataAdapter } from '../adapters/socrata_optimized.js';
 import { extractJobPostings, DEFAULT_JOB_CONFIG } from '../adapters/job_postings.js';
 import { logger } from '../util/logger.js';
 import { parseDate } from '../util/dates.js';
+import { parseCliArgs as parseSharedCliArgs, CLI_CONFIGS } from '../util/cli.js';
 import type { ExtractArgs } from '../types.js';
 
 // Load environment variables
@@ -22,64 +21,8 @@ config();
  * Parse command line arguments
  */
 function parseCliArgs(): ExtractArgs {
-  const { values } = parseArgs({
-    args: process.argv.slice(2),
-    options: {
-      city: {
-        type: 'string',
-        short: 'c',
-      },
-      dataset: {
-        type: 'string',
-        short: 'd',
-      },
-      since: {
-        type: 'string',
-        short: 's',
-      },
-      help: {
-        type: 'boolean',
-        short: 'h',
-      },
-      limit: {
-        type: 'string',
-        short: 'l',
-      },
-      optimized: {
-        type: 'boolean',
-        short: 'o',
-      },
-    },
-  });
-
-  if (values.help) {
-    console.log(`
-Usage: npm run extract -- --city <city> [--dataset <dataset>] [--since <date>] [--optimized] [--include-occupancy]
-
-Options:
-  -c, --city <city>        City name (required)
-  -d, --dataset <dataset>  Specific dataset to extract (optional)
-  -s, --since <date>       Extract records since this date (optional)
-  -h, --help              Show this help message
-  -o, --optimized         Use optimized Socrata adapter (optional)
-  -i, --include-occupancy  Include occupancy and inspection data extraction (optional)
-  -l, --limit <limit>      Maximum number of records to extract (optional)
-
-Examples:
-  npm run extract -- --city chicago
-  npm run extract -- --city chicago --dataset building_permits
-  npm run extract -- --city chicago --since 2024-01-01
-  npm run extract -- --city chicago --optimized
-  npm run extract -- --city chicago --include-occupancy
-    `);
-    process.exit(0);
-  }
-
-  if (!values.city) {
-    console.error('Error: --city is required');
-    process.exit(1);
-  }
-
+  const values = parseSharedCliArgs(CLI_CONFIGS.extract);
+  
   const result: ExtractArgs = {
     city: values.city as string,
   };
@@ -95,11 +38,6 @@ Examples:
   if (values.limit) {
     result.maxRecords = parseInt(values.limit as string, 10);
   }
-  
-  if (values.optimized) {
-    result.optimized = true;
-  }
-  
   
   return result;
 }
@@ -150,10 +88,8 @@ async function runExtraction(options: {
   const cityConfig = loadCityConfig(options.city);
   
   try {
-    // Extract traditional Socrata datasets
-    const adapter = options.optimized 
-      ? createOptimizedSocrataAdapter(cityConfig, storage)
-      : createSocrataAdapter(cityConfig, storage);
+    // Extract Socrata datasets using optimized adapter
+    const adapter = createSocrataAdapter(cityConfig, storage);
 
     const sinceDate = options.since ? new Date(options.since) : undefined;
     

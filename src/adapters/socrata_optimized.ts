@@ -6,6 +6,7 @@ import { createSodaClient } from '../soda/client.js';
 import { paginateDataset } from '../soda/paginate.js';
 import { buildDatasetUrl, getAppToken, type CityConfig, type DatasetConfig } from '../config/index.js';
 import { logger } from '../util/logger.js';
+import { generateRecordId, extractWatermark, simpleHash } from './socrata-utils.js';
 import type { Storage } from '../types.js';
 
 /**
@@ -18,10 +19,13 @@ export class OptimizedSocrataAdapter {
   private readonly MAX_CONCURRENT_REQUESTS = 8;
   private readonly BATCH_SIZE = 5000;
   private readonly DB_BATCH_SIZE = 500;
+  // Optional sink for publishing raw batches (e.g., to a queue)
+  private sink: ((rawRecords: Array<{ id: string; city: string; dataset: string; watermark: string; payload: any }>) => Promise<void>) | undefined;
 
-  constructor(cityConfig: CityConfig, storage: Storage) {
+  constructor(cityConfig: CityConfig, storage: Storage, options?: { sink?: (rawRecords: Array<{ id: string; city: string; dataset: string; watermark: string; payload: any }>) => Promise<void> }) {
     this.cityConfig = cityConfig;
     this.storage = storage;
+    this.sink = options?.sink;
   }
 
   /**
@@ -75,7 +79,7 @@ export class OptimizedSocrataAdapter {
 
         if (records.length > 0) {
           const lastRecord = records[records.length - 1];
-          finalWatermark = this.extractWatermark(lastRecord, dataset.watermark_field);
+          finalWatermark = extractWatermark(lastRecord, dataset.watermark_field);
         }
 
         // Process in batches to avoid memory issues
@@ -157,22 +161,6 @@ export class OptimizedSocrataAdapter {
   }
 
   /**
-   * Process a batch of records with bulk database operations
-   */
-  private async processBatch(records: any[], datasetName: string, dataset: DatasetConfig): Promise<void> {
-    const rawRecords = records.map(record => ({
-      id: this.generateRecordId(record, dataset),
-      city: this.cityConfig.city,
-      dataset: datasetName,
-      watermark: this.extractWatermark(record, dataset.watermark_field),
-      payload: record,
-    }));
-
-    // Bulk upsert with fallback to smaller batches
-    try {
-      const placeholders = rawRecords.map(() => "(?, ?, ?, ?, ?, datetime('now'))").join(',');
-      const values = rawRecords.flatMap(r => [r.id, r.city, r.dataset, r.watermark, JSON.stringify(r.payload)]);
-      
       await (this.storage as any).executeRaw(`
         INSERT OR REPLACE INTO raw (id, city, dataset, watermark, payload, inserted_at)
         VALUES ${placeholders}
@@ -229,6 +217,31 @@ export class OptimizedSocrataAdapter {
   }
 
   /**
+   * Query a dataset with custom parameters (for evaluation ground truth collection)
+   */
+  async queryDataset(datasetId: string, params: Record<string, any>): Promise<any[]> {
+    try {
+      const client = createSodaClient(this.cityConfig.base_url, getAppToken(this.cityConfig));
+      
+      logger.debug('Querying Socrata dataset', {
+        city: this.cityConfig.city,
+        datasetId,
+        params
+      });
+
+      const response = await client.getJson({
+        baseUrl: this.cityConfig.base_url,
+        path: `/resource/${datasetId}.json`,
+        params
+      });
+      return response;
+    } catch (error) {
+      logger.error('Socrata dataset query failed', { error, datasetId, params });
+      throw error;
+    }
+  }
+
+  /**
    * Test connection to Socrata API
    */
   async testConnection(): Promise<boolean> {
@@ -253,51 +266,63 @@ export class OptimizedSocrataAdapter {
   }
 
   /**
-   * Generate a stable record ID from the record data
+   * Process a batch of records with bulk database operations
    */
-  private generateRecordId(record: any, dataset: DatasetConfig): string {
-    if (record[':id']) {
-      return `${this.cityConfig.city}-${dataset.id}-${record[':id']}`;
+  private async processBatch(records: any[], datasetName: string, dataset: DatasetConfig): Promise<void> {
+    const rawRecords = records.map(record => ({
+      id: generateRecordId(record, dataset, this.cityConfig.city),
+      city: this.cityConfig.city,
+      dataset: datasetName,
+      watermark: extractWatermark(record, dataset.watermark_field),
+      payload: record,
+    }));
+
+    // If a sink is provided, publish to sink and return
+    if (this.sink) {
+      await this.sink(rawRecords);
+      return;
     }
 
-    const watermarkValue = record[dataset.watermark_field];
-    if (watermarkValue) {
-      const hash = this.simpleHash(JSON.stringify(record));
-      return `${this.cityConfig.city}-${dataset.id}-${watermarkValue}-${hash}`;
+    // Bulk upsert with fallback to smaller batches
+    try {
+      const placeholders = rawRecords.map(() => "(?, ?, ?, ?, ?, datetime('now'))").join(',');
+      const values = rawRecords.flatMap(r => [r.id, r.city, r.dataset, r.watermark, JSON.stringify(r.payload)]);
+      
+      await (this.storage as any).executeRaw(`
+        INSERT OR REPLACE INTO raw (id, city, dataset, watermark, payload, inserted_at)
+        VALUES ${placeholders}
+      `, values);
+    } catch (error: any) {
+      logger.warn('Bulk upsert failed, falling back to smaller batches', { error: error.message, batchSize: rawRecords.length });
+      
+      // Fallback to smaller batches of 100 records
+      for (let i = 0; i < rawRecords.length; i += 100) {
+        const smallBatch = rawRecords.slice(i, i + 100);
+        const smallPlaceholders = smallBatch.map(() => "(?, ?, ?, ?, ?, datetime('now'))").join(', ');
+        const smallValues = smallBatch.flatMap(r => [r.id, r.city, r.dataset, r.watermark, JSON.stringify(r.payload)]);
+        
+        try {
+          await (this.storage as any).executeRaw(`
+            INSERT OR REPLACE INTO raw (id, city, dataset, watermark, payload, inserted_at)
+            VALUES ${smallPlaceholders}
+          `, smallValues);
+        } catch (smallError: any) {
+          logger.error('Small batch upsert failed, falling back to individual inserts', { error: smallError.message });
+          
+          // Final fallback: individual inserts
+          for (const record of smallBatch) {
+            await this.storage.upsertRaw(record);
+          }
+        }
+      }
     }
-
-    const hash = this.simpleHash(JSON.stringify(record));
-    return `${this.cityConfig.city}-${dataset.id}-${hash}`;
   }
 
-  /**
-   * Extract watermark value from record
-   */
-  private extractWatermark(record: any, watermarkField: string): string {
-    const value = record[watermarkField];
-    if (value === null || value === undefined) {
-      return new Date().toISOString();
-    }
-    return String(value);
-  }
-
-  /**
-   * Simple hash function for generating IDs
-   */
-  private simpleHash(str: string): string {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return Math.abs(hash).toString(36);
-  }
 }
 
 /**
  * Create optimized Socrata adapter instance
  */
-export function createOptimizedSocrataAdapter(cityConfig: CityConfig, storage: Storage): OptimizedSocrataAdapter {
-  return new OptimizedSocrataAdapter(cityConfig, storage);
+export function createOptimizedSocrataAdapter(cityConfig: CityConfig, storage: Storage, options?: { sink?: (rawRecords: Array<{ id: string; city: string; dataset: string; watermark: string; payload: any }>) => Promise<void> }): OptimizedSocrataAdapter {
+  return new OptimizedSocrataAdapter(cityConfig, storage, options);
 }

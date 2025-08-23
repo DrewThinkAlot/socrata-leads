@@ -5,7 +5,6 @@
  */
 
 import { config } from 'dotenv';
-import { parseArgs } from 'node:util';
 import { loadCityConfig } from '../config/index.js';
 import { createStorage } from '../storage/index.js';
 import { logger } from '../util/logger.js';
@@ -14,9 +13,8 @@ import { parseDate, formatDateTimeISO } from '../util/dates.js';
 import { categorizeBusinessType, analyzeDescription } from '../util/llm.js';
 import { randomUUID } from 'crypto';
 import pLimit from 'p-limit';
-import { Storage } from '../storage/index.js';
-// normalizeRecord is defined in this file
-import { getConfig } from '../config/schema.js';
+import type { Storage } from '../storage/index.js';
+import { parseCliArgs as parseSharedCliArgs, CLI_CONFIGS } from '../util/cli.js';
 
 // Load environment variables
 config();
@@ -25,67 +23,14 @@ config();
  * Parse command line arguments
  */
 function parseCliArgs() {
-  const { values } = parseArgs({
-    args: process.argv.slice(2),
-    options: {
-      city: {
-        type: 'string',
-        short: 'c',
-      },
-      dataset: {
-        type: 'string',
-        short: 'd',
-      },
-      fast: {
-        type: 'boolean',
-        short: 'f',
-      },
-      workers: {
-        type: 'string',
-        short: 'w',
-      },
-      batchSize: {
-        type: 'string',
-        short: 'b',
-      },
-      resume: {
-        type: 'boolean',
-        short: 'r',
-      },
-      help: {
-        type: 'boolean',
-        short: 'h',
-      },
-    },
-  });
-
-  if (values.help) {
-    console.log(`
-Usage: npm run normalize -- --city <city> [--dataset <dataset>]
-
-Options:
-  -c, --city <city>        City name (required)
-  -d, --dataset <dataset>  Specific dataset to normalize (optional)
-  -h, --help              Show this help message
-
-Examples:
-  npm run normalize -- --city chicago
-  npm run normalize -- --city chicago --dataset building_permits
-    `);
-    process.exit(0);
-  }
-
-  if (!values.city) {
-    console.error('Error: --city is required');
-    process.exit(1);
-  }
-
+  const values = parseSharedCliArgs(CLI_CONFIGS.normalize);
+  
   return {
     city: values.city as string,
-    dataset: values.dataset as string | undefined,
-    fastMode: values.fast as boolean,
-    workers: parseInt(values.workers as string) || 2,
-    batchSize: parseInt(values.batchSize as string) || 5000,
+    dataset: values.dataset as string,
+    fast: values.fast as boolean,
+    workers: values.workers ? parseInt(values.workers as string, 10) : undefined,
+    batchSize: values.batchSize ? parseInt(values.batchSize as string, 10) : undefined,
     resume: values.resume as boolean,
   };
 }
@@ -255,7 +200,7 @@ function evaluateCoalesce(expression: string, payload: any): string | null {
  */
 async function main() {
   const args = parseCliArgs();
-  
+  let storage: Storage | null = null;
   try {
     logger.info('Starting data normalization', args);
 
@@ -263,7 +208,7 @@ async function main() {
     const cityConfig = loadCityConfig(args.city);
     
     // Create storage instance
-    const storage = await createStorage();
+    storage = await createStorage();
     
     // Get raw records to normalize
     const rawRecords = await storage.getRawByCity(args.city, args.dataset);
@@ -276,19 +221,20 @@ async function main() {
     
     logger.info(`Found ${rawRecords.length} raw records to normalize`);
     
-    const CFG = getConfig();
+    // Environment configuration
+    const LLM_ENABLED = process.env.LLM_ENABLED === 'true';
     
     // Log configuration for debugging
     logger.info('Configuration', {
-      fastMode: args.fastMode,
+      fast: args.fast,
       workers: args.workers,
       batchSize: args.batchSize,
-      LLM_ENABLED: CFG.LLM_ENABLED
+      LLM_ENABLED
     });
     // Dynamic configuration based on mode
-    const useLLM = !args.fastMode && CFG.LLM_ENABLED;
-    const workers = args.workers;
-    const batchSize = args.batchSize;
+    const useLLM = !args.fast && LLM_ENABLED;
+    const workers = args.workers ?? 2;
+    const batchSize = args.batchSize ?? 5000;
     
     // Separate limits for LLM vs non-LLM operations
     const llmLimit = pLimit(useLLM ? 2 : 1); // LLM calls (minimum 1)
@@ -335,7 +281,9 @@ async function main() {
               }
               
               // Store normalized record
-              await storage.insertNormalized(normalized);
+              if (storage) {
+                await storage.insertNormalized(normalized);
+              }
               
               // Update progress checkpoint
               if ((i + batch.indexOf(rawRecord)) % 1000 === 0) {
@@ -405,8 +353,10 @@ async function main() {
       } : error,
       args 
     });
-    await storage.close();
+    // Best-effort close handled in finally section below
     process.exit(1);
+  } finally {
+    try { if (storage) { await storage.close(); } } catch {}
   }
 }
 

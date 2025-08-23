@@ -5,15 +5,16 @@
  */
 
 import { config } from 'dotenv';
-import { parseArgs } from 'util';
+import { loadCityConfig } from '../config/index.js';
 import { createStorage } from '../storage/index.js';
 import { logger } from '../util/logger.js';
-import { getAgeInDays, parseDate } from '../util/dates.js';
+import { parseCliArgs as parseSharedCliArgs, CLI_CONFIGS } from '../util/cli.js';
 import { analyzeDescription, categorizeBusinessType, classifyProjectStage, estimateDaysRemaining, detectOperationalStatus, resolveBusinessEntity, extractContactInfoLLM, calculateDynamicLeadScore } from '../util/llm.js';
 import type { Event, Lead, NormalizedRecord } from '../types.js';
 import { randomUUID } from 'crypto';
 import { analyzeSpotOnIntelligence } from '../filters/spoton.js';
 import pLimit from 'p-limit';
+import { parseDate, getAgeInDays } from '../util/dates.js';
 
 // Load environment variables
 config();
@@ -22,39 +23,8 @@ config();
  * Parse command line arguments
  */
 function parseCliArgs() {
-  const { values } = parseArgs({
-    args: process.argv.slice(2),
-    options: {
-      city: {
-        type: 'string',
-        short: 'c',
-      },
-      help: {
-        type: 'boolean',
-        short: 'h',
-      },
-    },
-  });
-
-  if (values.help) {
-    console.log(`
-Usage: npm run score -- --city <city>
-
-Options:
-  -c, --city <city>  City name (required)
-  -h, --help        Show this help message
-
-Examples:
-  npm run score -- --city chicago
-    `);
-    process.exit(0);
-  }
-
-  if (!values.city) {
-    console.error('Error: --city is required');
-    process.exit(1);
-  }
-
+  const values = parseSharedCliArgs(CLI_CONFIGS.score);
+  
   return {
     city: values.city as string,
   };

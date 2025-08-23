@@ -163,13 +163,20 @@ async function executeStep(step: PipelineStep): Promise<StepResult> {
       const duration = performance.now() - startTime;
       const success = code === 0;
       
-      const result: StepResult = {
-        name: step.name,
-        success,
-        duration,
-        output: output.substring(0, 1000), // Limit output size
-        error: success ? undefined : error.substring(0, 500)
-      };
+      const result: StepResult = success
+        ? {
+            name: step.name,
+            success,
+            duration,
+            output: output.substring(0, 1000), // Limit output size
+          }
+        : {
+            name: step.name,
+            success,
+            duration,
+            output: output.substring(0, 1000), // Limit output size
+            error: error.substring(0, 500),
+          };
 
       logger.info(`Step ${step.name} ${success ? 'completed' : 'failed'}`, {
         duration: Math.round(duration),
@@ -286,7 +293,7 @@ async function main() {
       }
       
       // Execute steps (parallel if enabled, otherwise sequential)
-      const stepsToExecute = args.parallel ? nextSteps : [nextSteps[0]];
+      const stepsToExecute: PipelineStep[] = args.parallel ? nextSteps : [nextSteps[0]!];
       
       const stepPromises = stepsToExecute.map(async (step) => {
         runningSteps.add(step.name);
